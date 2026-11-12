@@ -184,7 +184,6 @@ class DataManager:
         data["settings"].setdefault("auto_ban_on_3_strikes", True)
         data["settings"].setdefault("broadcast", None)
 
-        # Đồng bộ tài khoản owner gốc với biến môi trường ADMIN_PIN
         p_hash, p_salt = hash_pin(DEFAULT_ADMIN_PIN)
         if DEFAULT_ADMIN_USER not in data["users"]:
             data["users"][DEFAULT_ADMIN_USER] = DataManager._default_admin_record()
@@ -198,7 +197,6 @@ class DataManager:
                 adm["pin_salt"] = p_salt
                 adm["has_pin"] = True
 
-        # Chuẩn hoá các user cũ nếu thiếu trường mới
         for u in data["users"].values():
             u.setdefault("strikes", 0)
             u.setdefault("pending_warning", None)
@@ -224,7 +222,6 @@ class DataManager:
 
     @staticmethod
     def sanitize_user_public(u):
-        """Loại bỏ dữ liệu nhạy cảm (pin_hash, pin_salt, session_token) trước khi gửi về client."""
         return {
             "username": u["username"],
             "role": u["role"],
@@ -319,7 +316,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>OmniRandom Arcade v5.0 — Pro Security & Visual Edition</title>
+<title>OmniRandom Arcade v5.1 — Pro Security & Visual Edition</title>
 <style>
   :root {
     --bg: #070b14;
@@ -376,7 +373,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     transition: background-color 0.35s var(--ease-spring), color 0.3s ease;
   }
 
-  /* Screen Shake Effect */
   body.screen-shake {
     animation: screenShake 0.42s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
   }
@@ -387,7 +383,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     40%, 60% { transform: translate3d(5px, -1px, 0); }
   }
 
-  /* Toast Notification Stack */
+  /* Toast Stack */
   .toast-container {
     position: fixed;
     top: 18px;
@@ -423,7 +419,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     to { opacity: 1; transform: translateX(0) scale(1); }
   }
 
-  /* Live Broadcast & Lockdown Banners */
   .broadcast-bar {
     background: linear-gradient(90deg, #b45309, #d97706, #b45309);
     color: #fff;
@@ -456,7 +451,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     to { opacity: 1; transform: translateY(0); }
   }
 
-  /* Header */
   header {
     background: var(--surface);
     backdrop-filter: blur(18px);
@@ -551,7 +545,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-color: rgba(239, 68, 68, 0.35);
   }
 
-  /* Navigation Strip */
   .mode-strip {
     background: var(--surface-2);
     backdrop-filter: blur(12px);
@@ -590,7 +583,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     text-decoration: line-through;
   }
 
-  /* Layout */
   .main-wrap {
     max-width: 1340px;
     width: 100%;
@@ -605,7 +597,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     grid-template-columns: 1fr;
   }
 
-  /* Arcade Hub Cards with Staggered Reveal */
   .hub-banner {
     text-align: center;
     margin-bottom: 24px;
@@ -685,10 +676,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--accent);
   }
 
-  /* View Transitions */
-  .view-pane {
-    display: none;
-  }
+  .view-pane { display: none; }
   .view-pane.active {
     display: block;
     animation: viewEnter 0.32s var(--ease-spring);
@@ -798,7 +786,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     100% { opacity: 1; transform: scale(1); }
   }
 
-  /* Slot Machine with Motion Blur */
+  /* Slot Machine */
   .slot-machine {
     background: linear-gradient(180deg, #1e1b4b, #090d16);
     border: 4px solid #f59e0b;
@@ -823,17 +811,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: inset 0 8px 16px rgba(0,0,0,0.25);
     transition: all 0.25s var(--ease-spring);
   }
-  .slot-window.spinning {
-    filter: blur(1.4px);
-    transform: scale(0.97);
-    color: #4f46e5;
-  }
+  .slot-window.spinning { filter: blur(1.4px); transform: scale(0.97); color: #4f46e5; }
   .slot-window.locked {
-    border-color: #10b981;
-    background: #ecfdf5;
-    color: #065f46;
-    transform: scale(1.04);
-    box-shadow: 0 0 22px rgba(16, 185, 129, 0.5);
+    border-color: #10b981; background: #ecfdf5; color: #065f46;
+    transform: scale(1.04); box-shadow: 0 0 22px rgba(16, 185, 129, 0.5);
   }
 
   /* Magic Hat */
@@ -846,7 +827,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    position: relative;
   }
   .magic-icon {
     font-size: 5.8rem;
@@ -933,7 +913,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .team-box h4 { font-size: 0.98rem; color: var(--accent); margin-bottom: 9px; display: flex; justify-content: space-between; }
   .team-box ul { list-style: none; display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; font-weight: 600; }
 
-  /* Admin Center Grids */
+  /* Admin Center */
   .admin-subgrid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -1024,7 +1004,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 20px;
     padding: 24px;
     width: 100%;
-    max-width: 450px;
+    max-width: 460px;
     box-shadow: 0 20px 50px rgba(0,0,0,0.6);
     display: flex;
     flex-direction: column;
@@ -1044,6 +1024,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 12px;
   }
   .perm-item { display: flex; align-items: center; gap: 8px; font-size: 0.84rem; font-weight: 600; cursor: pointer; }
+  .duration-row {
+    display: grid;
+    grid-template-columns: 1fr 140px;
+    gap: 10px;
+  }
+  .quick-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
 
   /* Drawer & History */
   .drawer-backdrop {
@@ -1083,7 +1073,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <canvas id="confetti-canvas"></canvas>
 <div class="toast-container" id="toast-container"></div>
 
-<!-- BIỂU NGỮ THÔNG BÁO TOÀN PHÒNG (LIVE BROADCAST) -->
+<!-- BIỂU NGỮ THÔNG BÁO TOÀN PHÒNG -->
 <div class="broadcast-bar" id="broadcast-bar">
   <span>📢</span>
   <span id="broadcast-text"></span>
@@ -1095,7 +1085,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <!-- MODAL 1: ĐĂNG NHẬP -->
 <div class="modal-overlay open" id="login-modal">
   <div class="modal-card">
-    <h2 style="font-size:1.35rem; font-weight:900;">🎪 Vào Phòng OmniRandom v5.0</h2>
+    <h2 style="font-size:1.35rem; font-weight:900;">🎪 Vào Phòng OmniRandom</h2>
     <p style="font-size:0.84rem; color:var(--text-muted);">
       Nhập tên của bạn để tham gia. Chủ phòng nhập tài khoản <b>admin</b> kèm mã PIN quản trị.
     </p>
@@ -1112,7 +1102,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- MODAL 2: CẢNH CÁO TRỰC TIẾP TỪ ADMIN (WARNING ALERT) -->
+<!-- MODAL 2: CẢNH CÁO TRỰC TIẾP TỪ ADMIN -->
 <div class="modal-overlay" id="warning-modal">
   <div class="modal-card warning-pulse" style="text-align:center;">
     <div style="font-size:3.6rem;">⚠️</div>
@@ -1150,9 +1140,53 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- MODAL 5: CẤM CÓ THỜI HẠN (PHÚT / GIỜ / NGÀY / NĂM) -->
+<div class="modal-overlay" id="temp-ban-modal" onclick="if(event.target===this) closeTempBanModal()">
+  <div class="modal-card">
+    <h3 style="font-size:1.15rem; font-weight:900;">⏳ Cấm Có Thời Hạn: <span id="tb-target-user" style="color:#fbbf24;"></span></h3>
+    <p style="font-size:0.83rem; color:var(--text-muted);">Chọn thời lượng và đơn vị thời gian muốn khoá tài khoản này:</p>
+    
+    <div class="quick-chips">
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(15, 'minutes')">15 Phút</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'hours')">1 Giờ</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(12, 'hours')">12 Giờ</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'days')">1 Ngày</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(7, 'days')">7 Ngày</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(30, 'days')">30 Ngày</button>
+      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'years')">1 Năm</button>
+    </div>
+
+    <div class="duration-row">
+      <div style="display:flex; flex-direction:column; gap:5px;">
+        <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Số lượng</label>
+        <input type="number" id="tb-duration" value="15" min="1" step="any">
+      </div>
+      <div style="display:flex; flex-direction:column; gap:5px;">
+        <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Đơn vị thời gian</label>
+        <select id="tb-unit">
+          <option value="minutes" selected>Phút</option>
+          <option value="hours">Giờ</option>
+          <option value="days">Ngày</option>
+          <option value="years">Năm</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:5px;">
+      <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Lý do cấm (Hiển thị cho người bị cấm)</label>
+      <input type="text" id="tb-reason" placeholder="VD: Spam nút quay liên tục...">
+    </div>
+
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+      <button class="btn-pill" onclick="closeTempBanModal()">Huỷ</button>
+      <button class="btn-action orange" style="padding:9px 18px;" onclick="submitTempBan()">⏳ Xác Nhận Cấm</button>
+    </div>
+  </div>
+</div>
+
 <header>
   <div class="brand-area">
-    <div class="brand-logo" onclick="openMode('hub')">🎪 OmniRandom v5.0</div>
+    <div class="brand-logo" onclick="openMode('hub')">🎪 OmniRandom</div>
     <div class="user-pill">
       <span>👤 <b id="current-username">Khách</b></span>
       <span class="role-badge role-member" id="current-role-badge">MEMBER</span>
@@ -1274,7 +1308,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Thanh Thông Báo Toàn Phòng (Live Broadcast) -->
       <div class="controls-bar">
         <strong style="font-size:0.85rem;">📢 Phát cảnh báo toàn phòng:</strong>
         <select id="bc-level">
@@ -1286,7 +1319,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="btn-pill" onclick="sendBroadcast(false)">Tắt thông báo</button>
       </div>
 
-      <!-- Thanh Thêm User Mới -->
       <div class="controls-bar">
         <strong style="font-size:0.85rem;">➕ Cấp tài khoản mới:</strong>
         <input type="text" id="new-u-name" placeholder="Tên người dùng..." style="width:155px;">
@@ -1299,7 +1331,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="btn-action green" style="padding:8px 16px; font-size:0.84rem;" onclick="adminAddUser()">Tạo User</button>
       </div>
 
-      <!-- Bảng Quản Lý Chi Tiết Từng User -->
       <div class="admin-table-wrap">
         <table class="admin-table">
           <thead>
@@ -1315,7 +1346,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </table>
       </div>
 
-      <!-- 2 Cột Phụ: IP Bị Chặn & Nhật Ký Bảo Mật -->
       <div class="admin-subgrid">
         <div class="admin-panel-box">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
@@ -1570,11 +1600,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let soundOn = true;
   let audioCtx = null;
   let editingPermUser = "";
+  let tempBanTargetUser = "";
   let currentWarnId = "";
 
   const PALETTE = ["#6366f1", "#ec4899", "#10b981", "#f59e0b", "#06b6d4", "#8b5cf6", "#ef4444", "#14b8a6"];
 
-  // --- SECURITY ESCAPER (CHỐNG XSS) ---
   function esc(str) {
     return String(str ?? "")
       .replace(/&/g, "&amp;")
@@ -1584,7 +1614,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
       .replace(/'/g, "&#39;");
   }
 
-  // --- TOAST NOTIFICATION SYSTEM ---
+  // Quy đổi thời gian còn lại sang Năm / Ngày / Giờ / Phút / Giây
+  function formatDurationVN(totalSec) {
+    totalSec = Math.max(0, Math.floor(totalSec));
+    if (totalSec <= 0) return "0 giây";
+    const years = Math.floor(totalSec / 31536000);
+    totalSec %= 31536000;
+    const days = Math.floor(totalSec / 86400);
+    totalSec %= 86400;
+    const hours = Math.floor(totalSec / 3600);
+    totalSec %= 3600;
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+
+    const parts = [];
+    if (years > 0) parts.push(`${years} năm`);
+    if (days > 0) parts.push(`${days} ngày`);
+    if (hours > 0) parts.push(`${hours} giờ`);
+    if (mins > 0) parts.push(`${mins} phút`);
+    if (parts.length === 0 || (years === 0 && days === 0 && hours === 0 && secs > 0)) {
+      parts.push(`${secs} giây`);
+    }
+    return parts.slice(0, 3).join(" ");
+  }
+
   function showToast(msg, type = "info") {
     const container = document.getElementById("toast-container");
     const el = document.createElement("div");
@@ -1606,7 +1659,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     document.body.classList.add("screen-shake");
   }
 
-  // --- WEB AUDIO SYNTHESIZER ---
   function ensureAudio() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -1668,7 +1720,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     step();
   }
 
-  // --- AUTHENTICATION & SECURITY HEADERS ---
   function authHeaders() {
     return {
       "Content-Type": "application/json",
@@ -1756,9 +1807,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       title.textContent = "TÀI KHOẢN ĐANG BỊ TẠM KHOÁ";
       desc.textContent = "Lý do: " + (reason || "Tạm khoá bởi Quản trị viên.");
       timerBox.style.display = "block";
-      const mins = Math.floor(remainingSec / 60);
-      const secs = Math.ceil(remainingSec % 60);
-      timerBox.textContent = `⏳ Thời gian khoá còn lại: ${mins} phút ${secs} giây`;
+      timerBox.textContent = `⏳ Thời gian khoá còn lại: ${formatDurationVN(remainingSec)}`;
     }
   }
 
@@ -1843,7 +1892,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         state.settings = data.settings || state.settings;
         applyRoomStateBanners();
 
-        // Kiểm tra cảnh cáo trực tiếp từ Admin
         const warn = data.user.pending_warning;
         if (warn && warn.id && warn.id !== currentWarnId) {
           currentWarnId = warn.id;
@@ -1891,8 +1939,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (u.status === "banned_perm") {
         statusHtml = `<span class="status-dot dot-banned"></span><b style="color:#f87171;">Cấm vĩnh viễn</b>`;
       } else if (u.status === "banned_temp") {
-        const rem = Math.max(0, Math.ceil((u.ban_until - now) / 60));
-        statusHtml = `<span class="status-dot dot-banned"></span><b style="color:#fbbf24;">Khoá (${rem}p)</b>`;
+        const remSec = Math.max(0, (u.ban_until || 0) - now);
+        statusHtml = `<span class="status-dot dot-banned"></span><b style="color:#fbbf24;">Khoá (${formatDurationVN(remSec)})</b>`;
       } else if (u.status === "kicked") {
         statusHtml = `<span class="status-dot dot-offline"></span><span style="color:#94a3b8;">Đã bị Kick</span>`;
       } else {
@@ -1937,7 +1985,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="admin-actions-row">
                 <button class="btn-xs warn" onclick="adminWarnUser('${safeUser}')">⚠️ Cảnh cáo</button>
                 <button class="btn-xs warn" onclick="adminKickUser('${safeUser}')">🥾 Kick</button>
-                <button class="btn-xs warn" onclick="adminTempBanUser('${safeUser}')">⏳ Cấm thời hạn</button>
+                <button class="btn-xs warn" onclick="openTempBanModal('${safeUser}')">⏳ Cấm thời hạn</button>
                 <button class="btn-xs ban" onclick="adminPermBanUser('${safeUser}', '${esc(u.ip)}')">🚫 Cấm vĩnh viễn</button>
                 <button class="btn-xs" onclick="adminChangePin('${safeUser}')">🔑 Đổi PIN</button>
                 ${u.status !== 'active' ? `<button class="btn-xs unban" onclick="adminAction('${safeUser}', 'unban', {})">🔓 Mở khoá</button>` : ''}
@@ -1949,7 +1997,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       `;
     }).join("");
 
-    // Render Banned IPs
     const ipBox = document.getElementById("admin-ips-list");
     const ipEntries = Object.entries(state.banned_ips || {});
     ipBox.innerHTML = ipEntries.length ? ipEntries.map(([ip, info]) => `
@@ -1959,7 +2006,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     `).join("") : '<div style="color:var(--text-muted); font-size:0.8rem;">Chưa có IP nào bị chặn.</div>';
 
-    // Render Audit Logs
     const auditBox = document.getElementById("admin-audit-list");
     auditBox.innerHTML = (state.audit_logs || []).map(log => `
       <div style="padding:6px 8px; border-bottom:1px solid var(--border);">
@@ -2012,14 +2058,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
     adminAction(u, "kick", { reason });
   }
 
-  function adminTempBanUser(u) {
-    const minsStr = prompt(`Nhập SỐ PHÚT cấm tạm thời đối với "${u}" (VD: 5, 15, 60, 1440):`, "15");
-    if (!minsStr) return;
-    const minutes = parseFloat(minsStr);
-    if (isNaN(minutes) || minutes <= 0) return showToast("Số phút không hợp lệ!", "error");
-    const reason = prompt("Nhập lý do tạm khoá:", `Tạm khoá ${minutes} phút bởi Admin.`);
-    if (reason === null) return;
-    adminAction(u, "ban_temp", { minutes, reason });
+  // --- MODAL CẤM CÓ THỜI HẠN (PHÚT / GIỜ / NGÀY / NĂM) ---
+  function openTempBanModal(username) {
+    tempBanTargetUser = username;
+    document.getElementById("tb-target-user").textContent = username;
+    document.getElementById("tb-duration").value = "15";
+    document.getElementById("tb-unit").value = "minutes";
+    document.getElementById("tb-reason").value = "";
+    document.getElementById("temp-ban-modal").classList.add("open");
+  }
+
+  function closeTempBanModal() {
+    document.getElementById("temp-ban-modal").classList.remove("open");
+  }
+
+  function setTempBanQuick(val, unit) {
+    document.getElementById("tb-duration").value = String(val);
+    document.getElementById("tb-unit").value = unit;
+  }
+
+  function submitTempBan() {
+    const duration = parseFloat(document.getElementById("tb-duration").value);
+    const unit = document.getElementById("tb-unit").value;
+    const reason = document.getElementById("tb-reason").value.trim();
+    if (isNaN(duration) || duration <= 0) {
+      return showToast("Số lượng thời gian cấm phải lớn hơn 0!", "error");
+    }
+    adminAction(tempBanTargetUser, "ban_temp", { duration, unit, reason });
+    closeTempBanModal();
   }
 
   function adminPermBanUser(u, ip) {
@@ -2240,7 +2306,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     showToast("Đã sao chép đường link phòng!", "success");
   }
 
-  // --- GAME 1: RACE WITH PARTICLES ---
+  // --- GAME 1: RACE ---
   let raceRunning = false;
   const THEME_CONFIG = {
     duck: { icon: "🦆", bg1: "#0284c7", bg2: "#0369a1", lane: "rgba(255,255,255,0.2)", trail: "rgba(255,255,255,0.55)" },
@@ -2277,7 +2343,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       ctx.strokeStyle = theme.lane; ctx.setLineDash([8, 8]);
       ctx.beginPath(); ctx.moveTo(0, (i + 1) * laneH); ctx.lineTo(W, (i + 1) * laneH); ctx.stroke(); ctx.setLineDash([]);
 
-      // Trail particles
       (r.particles || []).forEach(pt => {
         ctx.fillStyle = theme.trail;
         ctx.globalAlpha = pt.life;
@@ -2338,7 +2403,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     requestAnimationFrame(step);
   }
 
-  // --- GAME 2: WHEEL WITH LED BULBS & SPRING POINTER ---
+  // --- GAME 2: WHEEL ---
   let wheelAngle = 0, wheelSpinning = false;
   function parseWheelSlices() {
     return state.active_list.map(line => {
@@ -2356,7 +2421,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const ctx = canvas.getContext("2d"), cx = 260, cy = 260, r = 225;
     ctx.clearRect(0, 0, 520, 520);
 
-    // Outer metallic bezel
     ctx.beginPath(); ctx.arc(cx, cy, r + 14, 0, Math.PI * 2);
     ctx.fillStyle = "#1e293b"; ctx.fill();
     ctx.lineWidth = 3; ctx.strokeStyle = "#f59e0b"; ctx.stroke();
@@ -2374,7 +2438,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       a += arc;
     });
 
-    // Blinking LED bulbs around rim
     for (let i = 0; i < 16; i++) {
       const ba = (i / 16) * Math.PI * 2 + wheelAngle * 0.3;
       const bx = cx + Math.cos(ba) * (r + 7);
@@ -2385,12 +2448,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       ctx.fill();
     }
 
-    // Center hub
     ctx.beginPath(); ctx.arc(cx, cy, 32, 0, Math.PI * 2);
     ctx.fillStyle = "#0f172a"; ctx.fill(); ctx.lineWidth = 4; ctx.strokeStyle = "#f59e0b"; ctx.stroke();
     ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center"; ctx.fillText("QUAY", cx, cy + 5);
 
-    // Spring Pointer
     ctx.save();
     ctx.translate(cx + r + 18, cy);
     ctx.rotate(deflect);
@@ -2488,7 +2549,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     logHistory("🔮 Lồng Cầu", "Bật bóng xổ số", [picked.label]);
   }
 
-  // --- GAME 4: SLOT WITH MOTION BLUR ---
+  // --- GAME 4: SLOT ---
   function pullSlotMachine() {
     if (!canTriggerSpin()) return;
     const mode = document.getElementById("slot-mode").value;
@@ -2747,7 +2808,6 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
         with DATA_LOCK:
             data = DataManager._unlocked_load()
 
-            # 1. Kiểm tra IP Ban toàn cục
             if client_ip in data.get("banned_ips", {}):
                 ban_info = data["banned_ips"][client_ip]
                 return self._send_json(
@@ -2755,9 +2815,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     403,
                 )
 
-            # 2. ĐĂNG NHẬP
             if self.path == "/api/auth/login":
-                # Kiểm tra Brute-force rate limit
                 now = time.time()
                 attempts = [t for t in FAILED_LOGINS.get(client_ip, []) if now - t < 60]
                 FAILED_LOGINS[client_ip] = attempts
@@ -2839,7 +2897,6 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     }
                 )
 
-            # 3. HEARTBEAT REAL-TIME
             elif self.path == "/api/heartbeat":
                 from urllib.parse import unquote
 
@@ -2899,7 +2956,6 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     resp["audit_logs"] = data["audit_logs"]
                 return self._send_json(resp)
 
-            # CÁC API BÊN DƯỚI YÊU CẦU XÁC THỰC TOKEN HỢP LỆ
             actor = self._authenticate(data)
             if not actor:
                 return self._send_json({"error": "Phiên đăng nhập hết hạn hoặc không hợp lệ!"}, 401)
@@ -3031,13 +3087,30 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         target["session_token"] = str(uuid.uuid4())
                         DataManager.add_audit(data, actor["username"], f"Kick '{target_name}'", "warn")
                     elif action == "ban_temp":
-                        mins = float(payload.get("minutes", 15))
+                        val = float(payload.get("duration", payload.get("minutes", 15)))
+                        unit = payload.get("unit", "minutes")
+                        unit_map = {
+                            "minutes": (60, "phút"),
+                            "hours": (3600, "giờ"),
+                            "days": (86400, "ngày"),
+                            "years": (31536000, "năm"),
+                        }
+                        mult, unit_label = unit_map.get(unit, (60, "phút"))
+                        if val <= 0:
+                            return self._send_json({"error": "Thời gian cấm phải lớn hơn 0!"}, 400)
+                        total_seconds = val * mult
+                        default_reason = f"Tạm khoá {val:g} {unit_label} bởi Admin."
+                        reason = str(payload.get("reason", "")).strip() or default_reason
+
                         target["status"] = "banned_temp"
-                        target["ban_until"] = time.time() + (mins * 60)
-                        target["ban_reason"] = payload.get("reason", f"Tạm khoá {mins:g} phút.")
+                        target["ban_until"] = time.time() + total_seconds
+                        target["ban_reason"] = reason
                         target["session_token"] = str(uuid.uuid4())
                         DataManager.add_audit(
-                            data, actor["username"], f"Cấm '{target_name}' trong {mins:g} phút", "warn"
+                            data,
+                            actor["username"],
+                            f"Cấm '{target_name}' trong {val:g} {unit_label}",
+                            "warn",
                         )
                     elif action == "ban_perm":
                         reason = payload.get("reason", "Cấm vĩnh viễn bởi Admin.")
@@ -3075,7 +3148,6 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     }
                 )
 
-            # Kiểm tra quyền thao tác cho các API game/roster
             if (
                 data["settings"].get("room_lockdown")
                 and actor.get("role") not in ("owner", "admin")
@@ -3166,7 +3238,7 @@ if __name__ == "__main__":
     mobile_url = f"http://{lan_ip}:{PORT}"
 
     print("=" * 68)
-    print("🛡️ OMNIRANDOM ARCADE v5.0 (SECURITY, WARNINGS & FX EDITION) READY!")
+    print("🛡️ OMNIRANDOM ARCADE v5.1 (SECURITY, WARNINGS & FX EDITION) READY!")
     print("=" * 68)
     print(f"💻 Local URL : {local_url}")
     print(f"📱 Mobile IP : {mobile_url}")
@@ -3180,4 +3252,4 @@ if __name__ == "__main__":
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nĐã đóng OmniRandom Arcade v5.0.")
+            print("\nĐã đóng OmniRandom Arcade v5.1.")
