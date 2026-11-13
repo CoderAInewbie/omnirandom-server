@@ -10,21 +10,28 @@ import socketserver
 import string
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 import webbrowser
-from urllib.parse import urlparse
 
 PORT = int(os.environ.get("PORT", 8080))
 DATA_FILE = "random_data.json"
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PIN = os.environ.get("ADMIN_PIN", "1234")
 
-DATA_LOCK = threading.Lock()
+# Tuỳ chọn đồng bộ đám mây (VD: JSONBin.io v3 URL & X-Master-Key) để không mất dữ liệu khi Render restart
+CLOUD_SYNC_URL = os.environ.get("CLOUD_SYNC_URL", "").strip()
+CLOUD_SYNC_KEY = os.environ.get("CLOUD_SYNC_KEY", "").strip()
+
+DATA_LOCK = threading.RLock()
 FAILED_LOGINS = {}  # ip -> [timestamps]
+ACTION_RATE = {}    # username -> [timestamps]
 
 ALL_FEATURES = [
     "race",
     "wheel",
+    "survival",
     "cage",
     "slot",
     "hat",
@@ -123,6 +130,43 @@ def parse_device_label(ua):
     return "Trình duyệt Web"
 
 
+class CloudSync:
+    """Tuỳ chọn sao lưu JSON ra dịch vụ đám mây bên ngoài (JSONBin / REST API) bằng thư viện chuẩn."""
+
+    @staticmethod
+    def pull():
+        if not CLOUD_SYNC_URL:
+            return None
+        try:
+            req = urllib.request.Request(CLOUD_SYNC_URL, method="GET")
+            if CLOUD_SYNC_KEY:
+                req.add_header("X-Master-Key", CLOUD_SYNC_KEY)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                return raw.get("record", raw) if isinstance(raw, dict) else None
+        except Exception as e:
+            print(f"[CloudSync Pull Warning]: {e}")
+            return None
+
+    @staticmethod
+    def push_async(data_snapshot):
+        if not CLOUD_SYNC_URL:
+            return
+
+        def _worker():
+            try:
+                body = json.dumps(data_snapshot, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(CLOUD_SYNC_URL, data=body, method="PUT")
+                req.add_header("Content-Type", "application/json")
+                if CLOUD_SYNC_KEY:
+                    req.add_header("X-Master-Key", CLOUD_SYNC_KEY)
+                urllib.request.urlopen(req, timeout=6).read()
+            except Exception as e:
+                print(f"[CloudSync Push Warning]: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
 class DataManager:
     @staticmethod
     def _default_admin_record():
@@ -134,6 +178,7 @@ class DataManager:
             "has_pin": True,
             "role": "owner",
             "status": "active",
+            "muted": False,
             "ban_until": 0,
             "ban_reason": "",
             "strikes": 0,
@@ -146,43 +191,48 @@ class DataManager:
         }
 
     @staticmethod
-    def _unlocked_load():
-        if not os.path.exists(DATA_FILE):
-            initial = {
-                "presets": DEFAULT_PRESETS,
-                "active_list": DEFAULT_PRESETS["Danh sách Thành viên / Lớp"],
-                "history": [],
-                "audit_logs": [],
-                "users": {DEFAULT_ADMIN_USER: DataManager._default_admin_record()},
-                "banned_ips": {},
-                "settings": {
-                    "allow_guest_join": True,
-                    "room_lockdown": False,
-                    "auto_ban_on_3_strikes": True,
-                    "broadcast": None,
-                },
-            }
-            DataManager._unlocked_save(initial)
-            return initial
+    def _build_initial_data():
+        return {
+            "roster_version": 1,
+            "presets": DEFAULT_PRESETS,
+            "active_list": list(DEFAULT_PRESETS["Danh sách Thành viên / Lớp"]),
+            "history": [],
+            "chat_messages": [],
+            "live_event": None,
+            "audit_logs": [],
+            "users": {DEFAULT_ADMIN_USER: DataManager._default_admin_record()},
+            "banned_ips": {},
+            "settings": {
+                "allow_guest_join": True,
+                "room_lockdown": False,
+                "chat_enabled": True,
+                "auto_ban_on_3_strikes": True,
+                "broadcast": None,
+            },
+        }
 
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
+    @staticmethod
+    def _normalize_data(data):
+        if not isinstance(data, dict):
             data = {}
-
+        data.setdefault("roster_version", 1)
         data.setdefault("presets", DEFAULT_PRESETS)
         if not data.get("active_list"):
-            data["active_list"] = DEFAULT_PRESETS["Danh sách Thành viên / Lớp"]
+            data["active_list"] = list(DEFAULT_PRESETS["Danh sách Thành viên / Lớp"])
         data.setdefault("history", [])
+        data.setdefault("chat_messages", [])
+        data.setdefault("live_event", None)
         data.setdefault("audit_logs", [])
         data.setdefault("users", {})
         data.setdefault("banned_ips", {})
         data.setdefault("settings", {})
-        data["settings"].setdefault("allow_guest_join", True)
-        data["settings"].setdefault("room_lockdown", False)
-        data["settings"].setdefault("auto_ban_on_3_strikes", True)
-        data["settings"].setdefault("broadcast", None)
+
+        st = data["settings"]
+        st.setdefault("allow_guest_join", True)
+        st.setdefault("room_lockdown", False)
+        st.setdefault("chat_enabled", True)
+        st.setdefault("auto_ban_on_3_strikes", True)
+        st.setdefault("broadcast", None)
 
         p_hash, p_salt = hash_pin(DEFAULT_ADMIN_PIN)
         if DEFAULT_ADMIN_USER not in data["users"]:
@@ -191,6 +241,7 @@ class DataManager:
             adm = data["users"][DEFAULT_ADMIN_USER]
             adm["role"] = "owner"
             adm["status"] = "active"
+            adm["muted"] = False
             adm["allowed_features"] = list(ALL_FEATURES)
             if not verify_pin(DEFAULT_ADMIN_PIN, adm.get("pin_hash", ""), adm.get("pin_salt", "")):
                 adm["pin_hash"] = p_hash
@@ -199,6 +250,7 @@ class DataManager:
 
         for u in data["users"].values():
             u.setdefault("strikes", 0)
+            u.setdefault("muted", False)
             u.setdefault("pending_warning", None)
             u.setdefault("device", "Web")
             u.setdefault("has_pin", bool(u.get("pin_hash")))
@@ -209,14 +261,32 @@ class DataManager:
                     u["pin_hash"] = h
                     u["pin_salt"] = s
                     u["has_pin"] = True
-
         return data
 
     @staticmethod
-    def _unlocked_save(data):
+    def _unlocked_load():
+        if not os.path.exists(DATA_FILE):
+            cloud_data = CloudSync.pull()
+            initial = DataManager._normalize_data(cloud_data) if cloud_data else DataManager._build_initial_data()
+            DataManager._unlocked_save(initial, sync_cloud=False)
+            return initial
+
         try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        return DataManager._normalize_data(data)
+
+    @staticmethod
+    def _unlocked_save(data, sync_cloud=True):
+        tmp_file = f"{DATA_FILE}.tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, DATA_FILE)
+            if sync_cloud:
+                CloudSync.push_async(data)
         except Exception as e:
             print(f"[Lỗi lưu file]: {e}")
 
@@ -226,6 +296,7 @@ class DataManager:
             "username": u["username"],
             "role": u["role"],
             "status": u["status"],
+            "muted": bool(u.get("muted", False)),
             "ban_until": u.get("ban_until", 0),
             "ban_reason": u.get("ban_reason", ""),
             "strikes": u.get("strikes", 0),
@@ -259,7 +330,7 @@ class DataManager:
                 "level": level,
             },
         )
-        data["audit_logs"] = data["audit_logs"][:80]
+        data["audit_logs"] = data["audit_logs"][:100]
 
 
 class RandomBackend:
@@ -316,16 +387,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>OmniRandom Arcade v5.1 — Pro Security & Visual Edition</title>
+<title>OmniRandom Arcade v6.0 — Ultimate Live & Security Edition</title>
 <style>
   :root {
-    --bg: #070b14;
-    --bg-grad: radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.16), transparent 40%),
-               radial-gradient(circle at 85% 90%, rgba(236, 72, 153, 0.14), transparent 45%);
-    --surface: rgba(22, 31, 51, 0.84);
-    --surface-solid: #161f33;
-    --surface-2: rgba(33, 45, 72, 0.72);
-    --surface-hover: rgba(51, 68, 105, 0.85);
+    --bg: #060913;
+    --bg-grad: radial-gradient(circle at 12% 8%, rgba(99, 102, 241, 0.18), transparent 42%),
+               radial-gradient(circle at 88% 92%, rgba(236, 72, 153, 0.14), transparent 45%);
+    --surface: rgba(20, 29, 49, 0.86);
+    --surface-solid: #141d31;
+    --surface-2: rgba(31, 43, 70, 0.75);
+    --surface-hover: rgba(49, 66, 104, 0.88);
     --text: #f8fafc;
     --text-muted: #94a3b8;
     --primary: #6366f1;
@@ -335,16 +406,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --danger: #ef4444;
     --border: rgba(255, 255, 255, 0.11);
     --radius: 18px;
-    --shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+    --shadow: 0 14px 36px rgba(0, 0, 0, 0.48);
     --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   }
   [data-theme="light"] {
     --bg: #eef2f9;
     --bg-grad: radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.12), transparent 45%),
                radial-gradient(circle at 85% 90%, rgba(245, 158, 11, 0.1), transparent 45%);
-    --surface: rgba(255, 255, 255, 0.9);
+    --surface: rgba(255, 255, 255, 0.92);
     --surface-solid: #ffffff;
-    --surface-2: rgba(241, 245, 249, 0.9);
+    --surface-2: rgba(241, 245, 249, 0.92);
     --surface-hover: #e2e8f0;
     --text: #0f172a;
     --text-muted: #64748b;
@@ -383,16 +454,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     40%, 60% { transform: translate3d(5px, -1px, 0); }
   }
 
+  /* Projector Fullscreen Stage Mode */
+  .stage-card.projector-mode {
+    position: fixed;
+    inset: 0;
+    z-index: 95;
+    border-radius: 0;
+    overflow-y: auto;
+    padding: 24px 32px;
+    background: var(--surface-solid);
+  }
+
   /* Toast Stack */
   .toast-container {
     position: fixed;
     top: 18px;
     right: 18px;
-    z-index: 200;
+    z-index: 250;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    max-width: 360px;
+    max-width: 370px;
     pointer-events: none;
   }
   .toast {
@@ -403,7 +485,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--text);
     padding: 13px 16px;
     border-radius: 13px;
-    box-shadow: 0 12px 30px rgba(0,0,0,0.45);
+    box-shadow: 0 12px 30px rgba(0,0,0,0.48);
     font-size: 0.87rem;
     font-weight: 600;
     display: flex;
@@ -414,6 +496,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .toast.success { border-left-color: var(--success); }
   .toast.warning { border-left-color: var(--accent); }
   .toast.error { border-left-color: var(--danger); }
+  .toast.live { border-left-color: #ec4899; }
   @keyframes toastIn {
     from { opacity: 0; transform: translateX(40px) scale(0.92); }
     to { opacity: 1; transform: translateX(0) scale(1); }
@@ -493,6 +576,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     gap: 7px;
+    cursor: pointer;
   }
   .role-badge {
     padding: 2px 8px;
@@ -584,64 +668,54 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   .main-wrap {
-    max-width: 1340px;
+    max-width: 1380px;
     width: 100%;
     margin: 0 auto;
     padding: 22px;
     flex: 1;
     display: grid;
-    grid-template-columns: 1fr 315px;
+    grid-template-columns: 1fr 330px;
     gap: 22px;
   }
-  .main-wrap.full-hub {
+  .main-wrap.full-admin {
     grid-template-columns: 1fr;
   }
 
   .hub-banner {
     text-align: center;
-    margin-bottom: 24px;
+    margin-bottom: 22px;
     animation: fadeUp 0.45s var(--ease-spring);
   }
   .hub-banner h1 {
-    font-size: clamp(1.5rem, 3vw, 2.2rem);
+    font-size: clamp(1.5rem, 3vw, 2.15rem);
     font-weight: 900;
     margin-bottom: 6px;
   }
   .hub-banner p {
     color: var(--text-muted);
-    font-size: 0.94rem;
+    font-size: 0.92rem;
   }
   .arcade-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(265px, 1fr));
-    gap: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
+    gap: 16px;
   }
   .arcade-card {
     background: var(--surface);
     backdrop-filter: blur(14px);
     border: 1px solid var(--border);
     border-radius: 20px;
-    padding: 20px;
+    padding: 19px;
     cursor: pointer;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 9px;
     box-shadow: var(--shadow);
     position: relative;
     overflow: hidden;
     transition: transform 0.28s var(--ease-spring), border-color 0.25s ease, box-shadow 0.28s ease;
     animation: fadeUp 0.45s var(--ease-spring) backwards;
   }
-  .arcade-card:nth-child(1) { animation-delay: 0.03s; }
-  .arcade-card:nth-child(2) { animation-delay: 0.06s; }
-  .arcade-card:nth-child(3) { animation-delay: 0.09s; }
-  .arcade-card:nth-child(4) { animation-delay: 0.12s; }
-  .arcade-card:nth-child(5) { animation-delay: 0.15s; }
-  .arcade-card:nth-child(6) { animation-delay: 0.18s; }
-  .arcade-card:nth-child(7) { animation-delay: 0.21s; }
-  .arcade-card:nth-child(8) { animation-delay: 0.24s; }
-  .arcade-card:nth-child(9) { animation-delay: 0.27s; }
-
   .arcade-card:hover {
     transform: translateY(-6px) scale(1.015);
     border-color: var(--primary);
@@ -655,22 +729,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     filter: grayscale(0.8);
   }
   .arcade-icon {
-    width: 56px;
-    height: 56px;
-    border-radius: 16px;
+    width: 54px;
+    height: 54px;
+    border-radius: 15px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.9rem;
+    font-size: 1.85rem;
     transition: transform 0.28s var(--ease-spring);
   }
-  .arcade-card h3 { font-size: 1.1rem; font-weight: 800; }
-  .arcade-card p { font-size: 0.85rem; color: var(--text-muted); line-height: 1.48; flex: 1; }
+  .arcade-card h3 { font-size: 1.06rem; font-weight: 800; }
+  .arcade-card p { font-size: 0.83rem; color: var(--text-muted); line-height: 1.45; flex: 1; }
   .arcade-tag {
     align-self: flex-start;
-    font-size: 0.72rem;
+    font-size: 0.7rem;
     font-weight: 800;
-    padding: 3px 10px;
+    padding: 3px 9px;
     border-radius: 99px;
     background: var(--surface-2);
     color: var(--accent);
@@ -786,6 +860,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
     100% { opacity: 1; transform: scale(1); }
   }
 
+  /* Survival Elimination Arena */
+  .survival-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: center;
+    padding: 20px;
+    background: var(--surface-2);
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    min-height: 220px;
+  }
+  .survivor-chip {
+    padding: 12px 18px;
+    border-radius: 13px;
+    background: var(--surface-solid);
+    border: 2px solid var(--primary);
+    font-weight: 800;
+    font-size: 1rem;
+    transition: all 0.35s var(--ease-spring);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  }
+  .survivor-chip.scanning {
+    background: #f59e0b;
+    color: #0f172a;
+    border-color: #fde047;
+    transform: scale(1.12);
+    box-shadow: 0 0 24px rgba(245, 158, 11, 0.7);
+  }
+  .survivor-chip.eliminated {
+    opacity: 0.32;
+    border-color: #ef4444;
+    text-decoration: line-through;
+    transform: scale(0.92);
+    filter: grayscale(1);
+  }
+  .survivor-chip.champion {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    color: #fff;
+    border-color: #fef08a;
+    transform: scale(1.18);
+    box-shadow: 0 0 35px rgba(245, 158, 11, 0.8);
+  }
+
   /* Slot Machine */
   .slot-machine {
     background: linear-gradient(180deg, #1e1b4b, #090d16);
@@ -817,9 +935,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     transform: scale(1.04); box-shadow: 0 0 22px rgba(16, 185, 129, 0.5);
   }
 
-  /* Magic Hat */
+  /* Magic Hat & 3D Flip Tickets */
   .magic-stage {
-    min-height: 300px;
+    min-height: 310px;
     background: radial-gradient(circle at center, #2e1065 0%, #070b14 100%);
     border-radius: 18px;
     padding: 26px;
@@ -848,13 +966,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: linear-gradient(135deg, #fef3c7, #fde68a);
     color: #78350f;
     border: 2px solid #f59e0b;
-    padding: 13px 22px;
+    padding: 14px 22px;
     border-radius: 13px;
-    font-size: 1.16rem;
+    font-size: 1.15rem;
     font-weight: 900;
+    cursor: pointer;
     box-shadow: 0 8px 22px rgba(245, 158, 11, 0.35);
     animation: cardFlipIn 0.45s var(--ease-spring);
+    transition: transform 0.2s var(--ease-spring);
   }
+  .magic-ticket.unrevealed {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: #fff;
+    border-color: #c4b5fd;
+  }
+  .magic-ticket:hover { transform: translateY(-3px) scale(1.03); }
   @keyframes cardFlipIn {
     from { opacity: 0; transform: perspective(500px) rotateY(-85deg) scale(0.8); }
     to { opacity: 1; transform: perspective(500px) rotateY(0deg) scale(1); }
@@ -912,6 +1038,61 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .team-box h4 { font-size: 0.98rem; color: var(--accent); margin-bottom: 9px; display: flex; justify-content: space-between; }
   .team-box ul { list-style: none; display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; font-weight: 600; }
+
+  /* Right Sidebar: Live Chat + History Tabs */
+  .side-column {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .side-card {
+    background: var(--surface);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    box-shadow: var(--shadow);
+  }
+  .chat-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    height: 230px;
+    overflow-y: auto;
+    margin: 10px 0;
+    padding-right: 4px;
+  }
+  .chat-msg {
+    background: var(--surface-2);
+    padding: 8px 10px;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    line-height: 1.35;
+    word-break: break-word;
+  }
+  .chat-msg .sender { font-weight: 800; color: var(--primary); margin-right: 5px; }
+  .chat-msg .sender.owner { color: #fbbf24; }
+  .chat-msg .sender.admin { color: #f472b6; }
+  .reaction-bar {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .react-btn {
+    flex: 1;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: transform 0.15s var(--ease-spring);
+  }
+  .react-btn:hover { transform: scale(1.15); border-color: var(--primary); }
+  .history-list { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; margin-top: 10px; }
+  .history-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 9px; font-size: 0.8rem; }
+  .history-card .meta { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.7rem; }
+  .history-card .val { font-weight: 800; color: var(--accent); margin-top: 2px; }
 
   /* Admin Center */
   .admin-subgrid {
@@ -984,7 +1165,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(5, 8, 15, 0.85);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    z-index: 110;
+    z-index: 120;
     display: none;
     align-items: center;
     justify-content: center;
@@ -994,18 +1175,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex;
     animation: modalFade 0.25s var(--ease-spring);
   }
-  @keyframes modalFade {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
+  @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
   .modal-card {
     background: var(--surface-solid);
     border: 1px solid var(--border);
     border-radius: 20px;
     padding: 24px;
     width: 100%;
-    max-width: 460px;
-    box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+    max-width: 470px;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.65);
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -1024,21 +1202,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 12px;
   }
   .perm-item { display: flex; align-items: center; gap: 8px; font-size: 0.84rem; font-weight: 600; cursor: pointer; }
-  .duration-row {
-    display: grid;
-    grid-template-columns: 1fr 140px;
-    gap: 10px;
-  }
-  .quick-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
+  .duration-row { display: grid; grid-template-columns: 1fr 140px; gap: 10px; }
+  .quick-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
-  /* Drawer & History */
+  /* Drawer */
   .drawer-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px);
-    z-index: 90; display: none; justify-content: flex-end;
+    z-index: 105; display: none; justify-content: flex-end;
   }
   .drawer-backdrop.open { display: flex; }
   .roster-drawer {
@@ -1046,22 +1216,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 22px; display: flex; flex-direction: column; gap: 14px;
     animation: slideDrawer 0.28s var(--ease-spring);
   }
-  @keyframes slideDrawer {
-    from { transform: translateX(100%); }
-    to { transform: translateX(0); }
-  }
-  .history-panel {
-    background: var(--surface); backdrop-filter: blur(14px);
-    border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; height: fit-content;
-  }
-  .history-list { display: flex; flex-direction: column; gap: 8px; max-height: 500px; overflow-y: auto; margin-top: 10px; }
-  .history-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 0.82rem; }
-  .history-card .meta { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.72rem; }
-  .history-card .val { font-weight: 800; color: var(--accent); margin-top: 2px; }
+  @keyframes slideDrawer { from { transform: translateX(100%); } to { transform: translateX(0); } }
 
-  #confetti-canvas { position: fixed; inset: 0; pointer-events: none; z-index: 150; }
+  #confetti-canvas { position: fixed; inset: 0; pointer-events: none; z-index: 180; }
 
-  @media (max-width: 980px) {
+  @media (max-width: 1024px) {
     .main-wrap { grid-template-columns: 1fr; padding: 12px; }
     .admin-subgrid { grid-template-columns: 1fr; }
     .slot-reels { grid-template-columns: 1fr; }
@@ -1085,7 +1244,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <!-- MODAL 1: ĐĂNG NHẬP -->
 <div class="modal-overlay open" id="login-modal">
   <div class="modal-card">
-    <h2 style="font-size:1.35rem; font-weight:900;">🎪 Vào Phòng OmniRandom</h2>
+    <h2 style="font-size:1.35rem; font-weight:900;">🎪 Vào Phòng OmniRandom v6.0</h2>
     <p style="font-size:0.84rem; color:var(--text-muted);">
       Nhập tên của bạn để tham gia. Chủ phòng nhập tài khoản <b>admin</b> kèm mã PIN quản trị.
     </p>
@@ -1106,7 +1265,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="modal-overlay" id="warning-modal">
   <div class="modal-card warning-pulse" style="text-align:center;">
     <div style="font-size:3.6rem;">⚠️</div>
-    <h2 style="color:#fbbf24; font-size:1.35rem; font-weight:900;" id="warn-title">CẢNH CÁO TỪ QUẢN TRỊ VIÊN</h2>
+    <h2 style="color:#fbbf24; font-size:1.35rem; font-weight:900;">CẢNH CÁO TỪ QUẢN TRỊ VIÊN</h2>
     <div id="warn-strike-badge" style="align-self:center; background:rgba(239,68,68,0.2); color:#fca5a5; padding:5px 14px; border-radius:99px; font-weight:800; font-size:0.85rem;"></div>
     <p style="font-size:0.98rem; line-height:1.5; color:var(--text); background:var(--surface-2); padding:14px; border-radius:12px;" id="warn-msg"></p>
     <button class="btn-action orange" style="justify-content:center;" onclick="acknowledgeWarning()">✅ Tôi đã hiểu và tuân thủ</button>
@@ -1140,30 +1299,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- MODAL 5: CẤM CÓ THỜI HẠN (PHÚT / GIỜ / NGÀY / NĂM) -->
-<div class="modal-overlay" id="temp-ban-modal" onclick="if(event.target===this) closeTempBanModal()">
+<!-- MODAL 5: HỘP THOẠI QUẢN TRỊ ĐA NĂNG (THAY THẾ HOÀN TOÀN PROMPT/CONFIRM) -->
+<div class="modal-overlay" id="unified-admin-modal" onclick="if(event.target===this) closeUnifiedModal()">
   <div class="modal-card">
-    <h3 style="font-size:1.15rem; font-weight:900;">⏳ Cấm Có Thời Hạn: <span id="tb-target-user" style="color:#fbbf24;"></span></h3>
-    <p style="font-size:0.83rem; color:var(--text-muted);">Chọn thời lượng và đơn vị thời gian muốn khoá tài khoản này:</p>
-    
-    <div class="quick-chips">
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(15, 'minutes')">15 Phút</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'hours')">1 Giờ</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(12, 'hours')">12 Giờ</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'days')">1 Ngày</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(7, 'days')">7 Ngày</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(30, 'days')">30 Ngày</button>
-      <button type="button" class="btn-xs" onclick="setTempBanQuick(1, 'years')">1 Năm</button>
-    </div>
+    <h3 style="font-size:1.15rem; font-weight:900;" id="uam-title">Thao tác quản trị</h3>
+    <p style="font-size:0.83rem; color:var(--text-muted);" id="uam-subtitle"></p>
 
-    <div class="duration-row">
-      <div style="display:flex; flex-direction:column; gap:5px;">
-        <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Số lượng</label>
-        <input type="number" id="tb-duration" value="15" min="1" step="any">
+    <!-- Khối chọn thời gian (chỉ hiện khi Cấm có thời hạn) -->
+    <div id="uam-duration-section" style="display:none; flex-direction:column; gap:10px;">
+      <div class="quick-chips">
+        <button type="button" class="btn-xs" onclick="setUamDuration(15, 'minutes')">15 Phút</button>
+        <button type="button" class="btn-xs" onclick="setUamDuration(1, 'hours')">1 Giờ</button>
+        <button type="button" class="btn-xs" onclick="setUamDuration(12, 'hours')">12 Giờ</button>
+        <button type="button" class="btn-xs" onclick="setUamDuration(1, 'days')">1 Ngày</button>
+        <button type="button" class="btn-xs" onclick="setUamDuration(7, 'days')">7 Ngày</button>
+        <button type="button" class="btn-xs" onclick="setUamDuration(1, 'years')">1 Năm</button>
       </div>
-      <div style="display:flex; flex-direction:column; gap:5px;">
-        <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Đơn vị thời gian</label>
-        <select id="tb-unit">
+      <div class="duration-row">
+        <input type="number" id="uam-dur-val" value="15" min="1" step="any" placeholder="Số lượng">
+        <select id="uam-dur-unit">
           <option value="minutes" selected>Phút</option>
           <option value="hours">Giờ</option>
           <option value="days">Ngày</option>
@@ -1172,26 +1326,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <div style="display:flex; flex-direction:column; gap:5px;">
-      <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);">Lý do cấm (Hiển thị cho người bị cấm)</label>
-      <input type="text" id="tb-reason" placeholder="VD: Spam nút quay liên tục...">
+    <!-- Ô nhập nội dung chính (Lý do / PIN mới / Địa chỉ IP) -->
+    <div id="uam-input-section" style="display:flex; flex-direction:column; gap:6px;">
+      <label style="font-size:0.78rem; font-weight:700; color:var(--text-muted);" id="uam-input-label">Nội dung</label>
+      <input type="text" id="uam-input-val" placeholder="Nhập thông tin...">
+      <div class="quick-chips" id="uam-reason-chips"></div>
     </div>
 
+    <!-- Checkbox tuỳ chọn phụ (VD: Chặn kèm IP khi cấm vĩnh viễn) -->
+    <label id="uam-checkbox-row" style="display:none; align-items:center; gap:8px; font-size:0.84rem; color:#fca5a5; cursor:pointer;">
+      <input type="checkbox" id="uam-extra-check">
+      <span id="uam-extra-label">Chặn kèm địa chỉ IP của tài khoản này</span>
+    </label>
+
     <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
-      <button class="btn-pill" onclick="closeTempBanModal()">Huỷ</button>
-      <button class="btn-action orange" style="padding:9px 18px;" onclick="submitTempBan()">⏳ Xác Nhận Cấm</button>
+      <button class="btn-pill" onclick="closeUnifiedModal()">Huỷ</button>
+      <button class="btn-action" id="uam-submit-btn" style="padding:9px 18px;" onclick="submitUnifiedModal()">Xác Nhận</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL 6: NHẬP DỮ LIỆU SAO LƯU JSON -->
+<div class="modal-overlay" id="import-modal" onclick="if(event.target===this) document.getElementById('import-modal').classList.remove('open')">
+  <div class="modal-card">
+    <h3 style="font-size:1.12rem; font-weight:900;">📥 Phục Hồi Dữ Liệu Từ Bản Sao Lưu JSON</h3>
+    <p style="font-size:0.82rem; color:var(--text-muted);">Dán nội dung file <code>omnirandom_backup.json</code> đã xuất trước đó để khôi phục toàn bộ tài khoản, lịch sử và danh sách mẫu:</p>
+    <textarea id="import-json-text" style="min-height:150px; font-family:monospace; font-size:0.78rem;" placeholder='{"users": ..., "presets": ...}'></textarea>
+    <div style="display:flex; gap:8px; justify-content:flex-end;">
+      <button class="btn-pill" onclick="document.getElementById('import-modal').classList.remove('open')">Huỷ</button>
+      <button class="btn-action green" style="padding:8px 16px;" onclick="submitImportBackup()">✅ Khôi Phục Ngay</button>
     </div>
   </div>
 </div>
 
 <header>
   <div class="brand-area">
-    <div class="brand-logo" onclick="openMode('hub')">🎪 OmniRandom</div>
-    <div class="user-pill">
+    <div class="brand-logo" onclick="openMode('hub')">🎪 OmniRandom v6.0</div>
+    <div class="user-pill" title="Bấm để đổi mã PIN cá nhân" onclick="openSelfChangePin()">
       <span>👤 <b id="current-username">Khách</b></span>
       <span class="role-badge role-member" id="current-role-badge">MEMBER</span>
+      <span style="font-size:0.72rem; opacity:0.75;">🔑</span>
     </div>
-    <span class="user-pill" style="font-size:0.76rem; color:var(--success);">
+    <span class="user-pill" style="font-size:0.76rem; color:var(--success); cursor:default;">
       🟢 <b id="online-count-badge">1</b> Online
     </span>
     <button class="btn-pill" onclick="openMode('hub')">🏠 Sảnh</button>
@@ -1209,9 +1385,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </header>
 
 <div class="mode-strip">
-  <button class="mode-tab active" data-mode="hub" onclick="openMode('hub')">🏠 Tất Cả</button>
+  <button class="mode-tab active" data-mode="hub" onclick="openMode('hub')">🏠 Sảnh</button>
   <button class="mode-tab" data-mode="race" onclick="openMode('race')">🦆 Đua Vịt / Xe</button>
   <button class="mode-tab" data-mode="wheel" onclick="openMode('wheel')">🎡 Vòng Quay</button>
+  <button class="mode-tab" data-mode="survival" onclick="openMode('survival')">🏆 Sinh Tồn</button>
   <button class="mode-tab" data-mode="cage" onclick="openMode('cage')">🔮 Lồng Cầu</button>
   <button class="mode-tab" data-mode="slot" onclick="openMode('slot')">🎰 Máy Slot</button>
   <button class="mode-tab" data-mode="hat" onclick="openMode('hat')">🎩 Mũ Ma Thuật</button>
@@ -1222,7 +1399,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="mode-tab" data-mode="admin" id="strip-admin-tab" style="display:none;" onclick="openMode('admin')">👑 Trung Tâm Admin</button>
 </div>
 
-<div class="main-wrap full-hub" id="main-wrap">
+<div class="main-wrap" id="main-wrap">
   <div>
     <!-- 0. SẢNH TRÒ CHƠI -->
     <section id="view-hub" class="view-pane active">
@@ -1241,7 +1418,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div class="arcade-icon" style="background:rgba(99,102,241,0.18);">🎡</div>
           <span class="arcade-tag">Đèn LED & Trọng số</span>
           <h3>Vòng Quay Siêu Cấp</h3>
-          <p>Vòng quay có chốt đinh va chạm vật lý, đèn LED nhấp nháy và tỷ lệ riêng.</p>
+          <p>Vòng quay có chốt đinh va chạm vật lý, đèn LED nhấp nháy và tự loại người trúng.</p>
+        </div>
+        <div class="arcade-card" data-feat="survival" onclick="openMode('survival')">
+          <div class="arcade-icon" style="background:rgba(245,158,11,0.18);">🏆</div>
+          <span class="arcade-tag">Mới • Loại Trực Tiếp</span>
+          <h3>Đấu Trường Sinh Tồn</h3>
+          <p>Quét tia sáng loại dần từng ứng viên qua mỗi vòng cho đến khi còn 1 nhà vô địch.</p>
         </div>
         <div class="arcade-card" data-feat="cage" onclick="openMode('cage')">
           <div class="arcade-icon" style="background:rgba(245,158,11,0.18);">🔮</div>
@@ -1257,9 +1440,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="arcade-card" data-feat="hat" onclick="openMode('hat')">
           <div class="arcade-icon" style="background:rgba(139,92,246,0.18);">🎩</div>
-          <span class="arcade-tag">Hộp Mù / Lật Thẻ 3D</span>
+          <span class="arcade-tag">Thẻ Lật 3D Tương Tác</span>
           <h3>Chiếc Mũ Ma Thuật</h3>
-          <p>Bỏ tất cả lựa chọn vào mũ ảo thuật hoặc hộp mù Gacha, lắc mạnh rút thăm.</p>
+          <p>Rút các lá thăm úp mặt từ mũ ảo thuật và bấm lật từng thẻ để tạo bất ngờ.</p>
         </div>
         <div class="arcade-card" data-feat="bomb" onclick="openMode('bomb')">
           <div class="arcade-icon" style="background:rgba(239,68,68,0.18);">💣</div>
@@ -1292,43 +1475,72 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <section id="view-admin" class="view-pane stage-card">
       <div class="stage-top">
         <div class="stage-title">👑 Trung Tâm Quản Trị Người Dùng, Cảnh Báo & Bảo Mật</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn-pill" onclick="exportBackupData()">📤 Xuất Backup JSON</button>
+          <button class="btn-pill" onclick="document.getElementById('import-modal').classList.add('open')">📥 Khôi phục JSON</button>
+        </div>
+      </div>
+
+      <!-- Cài đặt phòng & kỷ luật hàng loạt -->
+      <div class="controls-bar" style="justify-content:space-between;">
         <div style="display:flex; gap:14px; flex-wrap:wrap;">
           <label style="display:flex; align-items:center; gap:6px; font-size:0.84rem; cursor:pointer;">
             <input type="checkbox" id="toggle-guest-join" onchange="updateRoomSettings()">
             Cho phép khách tự tạo tên
           </label>
+          <label style="display:flex; align-items:center; gap:6px; font-size:0.84rem; cursor:pointer;">
+            <input type="checkbox" id="toggle-chat-enabled" onchange="updateRoomSettings()">
+            Bật Chat phòng
+          </label>
           <label style="display:flex; align-items:center; gap:6px; font-size:0.84rem; cursor:pointer; color:#fbbf24;">
             <input type="checkbox" id="toggle-auto-ban-strike" onchange="updateRoomSettings()">
-            Tự động cấm 30p khi đủ 3 gậy cảnh cáo
+            Tự cấm 30p khi đủ 3 gậy
           </label>
           <label style="display:flex; align-items:center; gap:6px; font-size:0.84rem; cursor:pointer; color:#f87171;">
             <input type="checkbox" id="toggle-lockdown" onchange="updateRoomSettings()">
-            🔒 Khoá khẩn cấp toàn phòng
+            🔒 Khoá khẩn cấp phòng
           </label>
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+          <button class="btn-xs warn" onclick="adminAction('', 'kick_all_guests', {})">🥾 Kick tất cả Member</button>
+          <button class="btn-xs unban" onclick="adminAction('', 'unban_all', {})">🔓 Mở khoá tất cả</button>
         </div>
       </div>
 
+      <!-- Phát cảnh báo toàn phòng -->
       <div class="controls-bar">
-        <strong style="font-size:0.85rem;">📢 Phát cảnh báo toàn phòng:</strong>
+        <strong style="font-size:0.85rem;">📢 Phát thông báo toàn phòng:</strong>
         <select id="bc-level">
           <option value="warning">⚠️ Cảnh báo Vàng</option>
           <option value="critical">🚨 Báo động Đỏ</option>
         </select>
-        <input type="text" id="bc-text" placeholder="Nhập nội dung thông báo hiện lên màn hình tất cả mọi người..." style="flex:1; min-width:220px;">
+        <input type="text" id="bc-text" placeholder="Nhập nội dung biểu ngữ hiện lên màn hình tất cả mọi người..." style="flex:1; min-width:220px;">
         <button class="btn-action orange" style="padding:8px 14px; font-size:0.84rem;" onclick="sendBroadcast(true)">Phát Ngay</button>
-        <button class="btn-pill" onclick="sendBroadcast(false)">Tắt thông báo</button>
+        <button class="btn-pill" onclick="sendBroadcast(false)">Tắt</button>
       </div>
 
-      <div class="controls-bar">
-        <strong style="font-size:0.85rem;">➕ Cấp tài khoản mới:</strong>
-        <input type="text" id="new-u-name" placeholder="Tên người dùng..." style="width:155px;">
-        <input type="text" id="new-u-pin" placeholder="Mã PIN bảo vệ" style="width:135px;">
-        <select id="new-u-role">
-          <option value="member">Member (Được quay)</option>
-          <option value="viewer">Viewer (Chỉ xem)</option>
-          <option value="admin">Admin (Quản trị)</option>
-        </select>
-        <button class="btn-action green" style="padding:8px 16px; font-size:0.84rem;" onclick="adminAddUser()">Tạo User</button>
+      <!-- Thêm User & Lọc tìm kiếm -->
+      <div class="controls-bar" style="justify-content:space-between;">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <strong style="font-size:0.85rem;">➕ Tạo User:</strong>
+          <input type="text" id="new-u-name" placeholder="Tên người dùng..." style="width:145px;">
+          <input type="text" id="new-u-pin" placeholder="Mã PIN" style="width:110px;">
+          <select id="new-u-role">
+            <option value="member">Member</option>
+            <option value="viewer">Viewer</option>
+            <option value="admin">Admin</option>
+          </select>
+          <button class="btn-action green" style="padding:8px 14px; font-size:0.84rem;" onclick="adminAddUser()">Tạo</button>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input type="text" id="admin-user-search" oninput="renderAdminCenter()" placeholder="🔍 Tìm tên / IP..." style="width:165px;">
+          <select id="admin-user-filter" onchange="renderAdminCenter()">
+            <option value="all">Tất cả trạng thái</option>
+            <option value="online">Đang Online</option>
+            <option value="banned">Đang bị Cấm / Kick</option>
+            <option value="warned">Có gậy cảnh cáo</option>
+          </select>
+        </div>
       </div>
 
       <div class="admin-table-wrap">
@@ -1350,7 +1562,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="admin-panel-box">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
             <strong style="font-size:0.95rem;">🌐 Danh sách IP bị chặn vĩnh viễn</strong>
-            <button class="btn-xs ban" onclick="adminBanIpPrompt()">+ Chặn IP thủ công</button>
+            <button class="btn-xs ban" onclick="openBanIpModal()">+ Chặn IP thủ công</button>
           </div>
           <div id="admin-ips-list" style="display:flex; flex-direction:column; gap:8px; max-height:220px; overflow-y:auto;"></div>
         </div>
@@ -1366,7 +1578,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <!-- 1. ĐUA VỊT / ĐUA XE -->
     <section id="view-race" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">🦆 Đường Đua Ngẫu Nhiên</div></div>
+      <div class="stage-top">
+        <div class="stage-title">🦆 Đường Đua Ngẫu Nhiên</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-race')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <select id="race-theme" onchange="drawIdleRace()">
           <option value="duck">🦆 Vịt Vàng Bơi Đua</option>
@@ -1391,11 +1606,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <!-- 2. VÒNG QUAY -->
     <section id="view-wheel" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">🎡 Vòng Quay Siêu Cấp (LED & Chốt Vật Lý)</div></div>
+      <div class="stage-top">
+        <div class="stage-title">🎡 Vòng Quay Siêu Cấp (LED & Chốt Vật Lý)</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-wheel')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <button class="btn-action orange" onclick="spinArcadeWheel()">🎡 QUAY NGAY</button>
-        <label style="display:flex; align-items:center; gap:6px; font-size:0.86rem;">
-          <input type="checkbox" id="wheel-auto-remove"> Tự loại ô đã trúng
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.86rem; cursor:pointer;">
+          <input type="checkbox" id="wheel-auto-remove"> Tự loại ô đã trúng sau khi quay
         </label>
       </div>
       <div class="canvas-box" style="padding:14px;">
@@ -1406,9 +1624,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- 3. LỒNG CẦU -->
+    <!-- 3. ĐẤU TRƯỜNG SINH TỒN (LAST MAN STANDING) -->
+    <section id="view-survival" class="view-pane stage-card">
+      <div class="stage-top">
+        <div class="stage-title">🏆 Đấu Trường Sinh Tồn (Loại Dần Tới Người Cuối Cùng)</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-survival')">🖥️ Trình Chiếu</button>
+      </div>
+      <div class="controls-bar">
+        <button class="btn-action red" onclick="eliminateOneRound()" id="surv-elim-btn">⚡ LOẠI 1 NGƯỜI NGẪU NHIÊN</button>
+        <button class="btn-pill" onclick="resetSurvivalArena()">🔄 Hồi sinh tất cả (<span id="surv-alive-count">0</span>)</button>
+      </div>
+      <div class="survival-grid" id="survival-grid"></div>
+      <div class="winner-banner" id="survival-banner" style="display:none;">
+        <div class="winner-text" id="survival-banner-text"></div>
+      </div>
+    </section>
+
+    <!-- 4. LỒNG CẦU -->
     <section id="view-cage" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">🔮 Lồng Cầu Xổ Số Vật Lý</div></div>
+      <div class="stage-top">
+        <div class="stage-title">🔮 Lồng Cầu Xổ Số Vật Lý</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-cage')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <select id="cage-source" onchange="initCageBalls()">
           <option value="roster">📋 Dùng Danh Sách Chung</option>
@@ -1426,9 +1663,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- 4. MÁY SLOT -->
+    <!-- 5. MÁY SLOT -->
     <section id="view-slot" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">🎰 Máy Kéo Slot 3 Trục</div></div>
+      <div class="stage-top">
+        <div class="stage-title">🎰 Máy Kéo Slot 3 Trục</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-slot')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <select id="slot-mode">
           <option value="roster_single">🎯 Bốc 1 mục (3 trục trùng nhau)</option>
@@ -1447,17 +1687,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- 5. MŨ MA THUẬT -->
+    <!-- 6. MŨ MA THUẬT & THẺ LẬT 3D -->
     <section id="view-hat" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">🎩 Chiếc Mũ Ma Thuật & Hộp Mù</div></div>
+      <div class="stage-top">
+        <div class="stage-title">🎩 Chiếc Mũ Ma Thuật & Thẻ Lật 3D</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-hat')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <select id="hat-theme" onchange="document.getElementById('hat-emoji').textContent=this.value">
           <option value="🎩">🎩 Mũ Ảo Thuật</option>
           <option value="🎁">🎁 Hộp Mù Gacha</option>
           <option value="🧧">🧧 Bao Lì Xì Đỏ</option>
         </select>
-        <label>Số phiếu: <input type="number" id="hat-count" value="1" min="1" max="10" style="width:70px;"></label>
+        <label>Số phiếu: <input type="number" id="hat-count" value="3" min="1" max="12" style="width:70px;"></label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.84rem; cursor:pointer;">
+          <input type="checkbox" id="hat-face-down" checked> Úp thẻ (Bấm từng thẻ để lật)
+        </label>
         <button class="btn-action" onclick="drawFromHat()">✨ LẮC & RÚT THĂM!</button>
+        <button class="btn-pill" onclick="revealAllHatCards()">👁️ Lật mở hết</button>
       </div>
       <div class="magic-stage">
         <div class="magic-icon" id="hat-emoji" onclick="drawFromHat()">🎩</div>
@@ -1465,9 +1712,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- 6. BOM HẸN GIỜ -->
+    <!-- 7. BOM HẸN GIỜ -->
     <section id="view-bomb" class="view-pane stage-card">
-      <div class="stage-top"><div class="stage-title">💣 Bom Hẹn Giờ Ngẫu Nhiên</div></div>
+      <div class="stage-top">
+        <div class="stage-title">💣 Bom Hẹn Giờ Ngẫu Nhiên</div>
+        <button class="btn-pill" onclick="toggleProjectorMode('view-bomb')">🖥️ Trình Chiếu</button>
+      </div>
       <div class="controls-bar">
         <label>Từ (s): <input type="number" id="bomb-min" value="5" min="2" max="300" style="width:70px;"></label>
         <label>Đến (s): <input type="number" id="bomb-max" value="15" min="2" max="300" style="width:70px;"></label>
@@ -1481,7 +1731,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- 7. XÚC XẮC, XU & BÀI -->
+    <!-- 8. XÚC XẮC, XU & BÀI -->
     <section id="view-tabletop" class="view-pane stage-card">
       <div class="stage-top"><div class="stage-title">🎲 Xúc Xắc, Đồng Xu & Bài Tây 3D</div></div>
       <div class="controls-bar">
@@ -1497,7 +1747,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="felt-table" id="felt-stage"></div>
     </section>
 
-    <!-- 8. CHIA ĐỘI -->
+    <!-- 9. CHIA ĐỘI -->
     <section id="view-teams" class="view-pane stage-card">
       <div class="stage-top"><div class="stage-title">👥 Chia Nhóm / Chia Đội</div></div>
       <div class="controls-bar">
@@ -1511,7 +1761,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="teams-board" id="teams-board"></div>
     </section>
 
-    <!-- 9. TIỆN ÍCH & RANDOM SỐ -->
+    <!-- 10. TIỆN ÍCH & RANDOM SỐ -->
     <section id="view-utility" class="view-pane stage-card">
       <div class="stage-top"><div class="stage-title">⚡ Random Số, Mật Khẩu, Mã Màu & UUID</div></div>
       <div class="controls-bar">
@@ -1536,13 +1786,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </section>
   </div>
 
-  <!-- LỊCH SỬ CHUNG -->
-  <aside class="history-panel" id="history-panel" style="display:none;">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <div style="font-weight:800; font-size:0.96rem;">🕒 Lịch Sử Phòng</div>
-      <button class="btn-pill" style="padding:4px 9px; font-size:0.74rem;" onclick="clearAllHistory()">Xoá</button>
+  <!-- CỘT PHẢI: LIVE ROOM CHAT + LỊCH SỬ -->
+  <aside class="side-column" id="side-column">
+    <!-- Chat & Cảm Xúc Thời Gian Thực -->
+    <div class="side-card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-weight:800; font-size:0.95rem;">💬 Trò Chuyện & Cảm Xúc</div>
+        <button class="btn-xs" id="clear-chat-btn" style="display:none;" onclick="adminAction('', 'clear_chat', {})">Xoá chat</button>
+      </div>
+      <div class="chat-feed" id="chat-feed"></div>
+      <div class="reaction-bar">
+        <button class="react-btn" onclick="sendChatOrReact('🔥')">🔥</button>
+        <button class="react-btn" onclick="sendChatOrReact('😂')">😂</button>
+        <button class="react-btn" onclick="sendChatOrReact('👏')">👏</button>
+        <button class="react-btn" onclick="sendChatOrReact('😱')">😱</button>
+        <button class="react-btn" onclick="sendChatOrReact('🎉')">🎉</button>
+      </div>
+      <div style="display:flex; gap:6px;">
+        <input type="text" id="chat-input" placeholder="Nhắn tin vào phòng..." style="flex:1; padding:7px 10px;" onkeydown="if(event.key==='Enter') sendChatInput()">
+        <button class="btn-action" style="padding:7px 13px; font-size:0.84rem;" onclick="sendChatInput()">Gửi</button>
+      </div>
     </div>
-    <div class="history-list" id="history-list"></div>
+
+    <!-- Lịch sử kết quả -->
+    <div class="side-card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-weight:800; font-size:0.95rem;">🕒 Lịch Sử Phòng</div>
+        <button class="btn-xs" onclick="clearAllHistory()">Xoá</button>
+      </div>
+      <div class="history-list" id="history-list"></div>
+    </div>
   </aside>
 </div>
 
@@ -1555,7 +1828,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div style="display:flex; gap:8px;">
       <select id="preset-picker" onchange="applyPreset()" style="flex:1;"></select>
-      <button class="btn-pill" onclick="saveAsNewPreset()">💾 Lưu mẫu</button>
+      <button class="btn-pill" onclick="openSavePresetModal()">💾 Lưu mẫu</button>
     </div>
     <textarea id="roster-textarea" style="flex:1;" oninput="syncRosterFromTextarea()"></textarea>
     <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1569,6 +1842,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const FEATURE_LABELS = {
     race: "🦆 Đua Vịt / Xe",
     wheel: "🎡 Vòng Quay",
+    survival: "🏆 Sinh Tồn",
     cage: "🔮 Lồng Cầu",
     slot: "🎰 Máy Slot",
     hat: "🎩 Mũ Ma Thuật",
@@ -1580,28 +1854,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
   };
 
   let state = {
+    roster_version: 1,
     presets: {},
     active_list: [],
     history: [],
+    chat_messages: [],
+    live_event: null,
     audit_logs: [],
     mobile_url: "",
     users: {},
     banned_ips: {},
-    settings: { allow_guest_join: true, room_lockdown: false, auto_ban_on_3_strikes: true, broadcast: null }
+    settings: { allow_guest_join: true, room_lockdown: false, chat_enabled: true, auto_ban_on_3_strikes: true, broadcast: null }
   };
 
   let session = {
     username: localStorage.getItem("omni_user") || "",
     token: localStorage.getItem("omni_token") || "",
     role: "member",
+    muted: false,
     allowed_features: Object.keys(FEATURE_LABELS)
   };
   let currentMode = "hub";
   let soundOn = true;
   let audioCtx = null;
   let editingPermUser = "";
-  let tempBanTargetUser = "";
   let currentWarnId = "";
+  let lastLiveEventId = "";
+  let uamContext = { type: "", target: "", ip: "" };
 
   const PALETTE = ["#6366f1", "#ec4899", "#10b981", "#f59e0b", "#06b6d4", "#8b5cf6", "#ef4444", "#14b8a6"];
 
@@ -1614,7 +1893,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       .replace(/'/g, "&#39;");
   }
 
-  // Quy đổi thời gian còn lại sang Năm / Ngày / Giờ / Phút / Giây
   function formatDurationVN(totalSec) {
     totalSec = Math.max(0, Math.floor(totalSec));
     if (totalSec <= 0) return "0 giây";
@@ -1642,7 +1920,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const container = document.getElementById("toast-container");
     const el = document.createElement("div");
     el.className = `toast ${type}`;
-    const icons = { info: "ℹ️", success: "✅", warning: "⚠️", error: "🚨" };
+    const icons = { info: "ℹ️", success: "✅", warning: "⚠️", error: "🚨", live: "🔴" };
     el.innerHTML = `<span>${icons[type] || "ℹ️"}</span><span>${esc(msg)}</span>`;
     container.appendChild(el);
     setTimeout(() => {
@@ -1650,13 +1928,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       el.style.transform = "translateX(30px)";
       el.style.transition = "all 0.25s ease";
       setTimeout(() => el.remove(), 260);
-    }, 3200);
+    }, 3400);
   }
 
   function triggerScreenShake() {
     document.body.classList.remove("screen-shake");
     void document.body.offsetWidth;
     document.body.classList.add("screen-shake");
+  }
+
+  function toggleProjectorMode(sectionId) {
+    const el = document.getElementById(sectionId);
+    if (!el) return;
+    el.classList.toggle("projector-mode");
+    const isProj = el.classList.contains("projector-mode");
+    showToast(isProj ? "Đã bật chế độ Trình Chiếu toàn màn hình (Esc để thoát)" : "Đã thoát chế độ Trình Chiếu", "info");
   }
 
   function ensureAudio() {
@@ -1720,6 +2006,103 @@ HTML_PAGE = r"""<!DOCTYPE html>
     step();
   }
 
+  // --- UNIFIED CUSTOM ADMIN MODAL (NO NATIVE PROMPT/CONFIRM) ---
+  function openUnifiedModal(cfg) {
+    uamContext = { type: cfg.type, target: cfg.target || "", ip: cfg.ip || "" };
+    document.getElementById("uam-title").textContent = cfg.title;
+    document.getElementById("uam-subtitle").textContent = cfg.subtitle || "";
+
+    const durSec = document.getElementById("uam-duration-section");
+    durSec.style.display = cfg.showDuration ? "flex" : "none";
+    if (cfg.showDuration) {
+      document.getElementById("uam-dur-val").value = "15";
+      document.getElementById("uam-dur-unit").value = "minutes";
+    }
+
+    const inpSec = document.getElementById("uam-input-section");
+    inpSec.style.display = cfg.hideInput ? "none" : "flex";
+    if (!cfg.hideInput) {
+      document.getElementById("uam-input-label").textContent = cfg.inputLabel || "Nội dung";
+      const inp = document.getElementById("uam-input-val");
+      inp.value = cfg.defaultValue || "";
+      inp.placeholder = cfg.placeholder || "";
+    }
+
+    const chipsBox = document.getElementById("uam-reason-chips");
+    chipsBox.innerHTML = (cfg.chips || []).map(c =>
+      `<button type="button" class="btn-xs" onclick="document.getElementById('uam-input-val').value='${esc(c)}'">${esc(c)}</button>`
+    ).join("");
+
+    const chkRow = document.getElementById("uam-checkbox-row");
+    chkRow.style.display = cfg.showCheckbox ? "flex" : "none";
+    if (cfg.showCheckbox) {
+      document.getElementById("uam-extra-check").checked = false;
+      document.getElementById("uam-extra-label").textContent = cfg.checkboxLabel || "";
+    }
+
+    const btn = document.getElementById("uam-submit-btn");
+    btn.textContent = cfg.submitText || "Xác Nhận";
+    btn.className = "btn-action " + (cfg.btnColor || "");
+
+    document.getElementById("unified-admin-modal").classList.add("open");
+    if (!cfg.hideInput) setTimeout(() => document.getElementById("uam-input-val").focus(), 80);
+  }
+
+  function closeUnifiedModal() {
+    document.getElementById("unified-admin-modal").classList.remove("open");
+  }
+
+  function setUamDuration(val, unit) {
+    document.getElementById("uam-dur-val").value = String(val);
+    document.getElementById("uam-dur-unit").value = unit;
+  }
+
+  async function submitUnifiedModal() {
+    const val = document.getElementById("uam-input-val").value.trim();
+    const { type, target, ip } = uamContext;
+
+    if (type === "warn_user") {
+      if (!val) return showToast("Vui lòng nhập nội dung cảnh cáo!", "warning");
+      await adminAction(target, "warn_user", { reason: val });
+    } else if (type === "kick") {
+      await adminAction(target, "kick", { reason: val || "Quản trị viên mời bạn ra khỏi phòng." });
+    } else if (type === "ban_temp") {
+      const duration = parseFloat(document.getElementById("uam-dur-val").value);
+      const unit = document.getElementById("uam-dur-unit").value;
+      if (isNaN(duration) || duration <= 0) return showToast("Thời gian cấm phải lớn hơn 0!", "error");
+      await adminAction(target, "ban_temp", { duration, unit, reason: val });
+    } else if (type === "ban_perm") {
+      const banIp = document.getElementById("uam-extra-check").checked;
+      await adminAction(target, "ban_perm", { reason: val || "Cấm vĩnh viễn bởi Admin.", ban_ip: banIp });
+    } else if (type === "change_pin") {
+      await adminAction(target, "change_pin", { new_pin: val });
+    } else if (type === "self_change_pin") {
+      const res = await fetch("/api/auth/change_my_pin", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ new_pin: val })
+      });
+      const d = await res.json();
+      if (!res.ok) return showToast(d.error || "Không thể đổi PIN", "error");
+      showToast(val ? "Đã cập nhật mã PIN bảo vệ cá nhân!" : "Đã gỡ mã PIN cá nhân!", "success");
+    } else if (type === "ban_ip_manual") {
+      if (!val) return showToast("Vui lòng nhập địa chỉ IP!", "warning");
+      await adminAction("", "ban_ip_manual", { ip: val, reason: "Chặn IP bởi Quản trị viên." });
+    } else if (type === "save_preset") {
+      if (!val) return showToast("Vui lòng đặt tên bộ danh sách!", "warning");
+      const res = await fetch("/api/presets", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ name: val, items: state.active_list })
+      });
+      state = await res.json();
+      renderPresetDropdown();
+      showToast(`Đã lưu mẫu "${val}"!`, "success");
+    }
+    closeUnifiedModal();
+  }
+
+  // --- AUTHENTICATION & HEARTBEAT ---
   function authHeaders() {
     return {
       "Content-Type": "application/json",
@@ -1757,6 +2140,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     session.username = data.user.username;
     session.token = data.token;
     session.role = data.user.role;
+    session.muted = !!data.user.muted;
     session.allowed_features = data.user.allowed_features;
     localStorage.setItem("omni_user", session.username);
     localStorage.setItem("omni_token", session.token);
@@ -1847,6 +2231,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const isAdmin = session.role === "owner" || session.role === "admin";
     document.getElementById("admin-nav-btn").style.display = isAdmin ? "inline-flex" : "none";
     document.getElementById("strip-admin-tab").style.display = isAdmin ? "inline-block" : "none";
+    document.getElementById("clear-chat-btn").style.display = isAdmin ? "inline-block" : "none";
 
     document.querySelectorAll(".arcade-card[data-feat]").forEach(card => {
       const f = card.getAttribute("data-feat");
@@ -1892,6 +2277,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
         state.settings = data.settings || state.settings;
         applyRoomStateBanners();
 
+        // Đồng bộ danh sách chung nếu có người cập nhật
+        if (data.roster_version && data.roster_version !== state.roster_version && Array.isArray(data.active_list)) {
+          state.roster_version = data.roster_version;
+          state.active_list = data.active_list;
+          document.getElementById("roster-textarea").value = state.active_list.join("\n");
+          updateRosterCounters();
+          if (currentMode === "race") drawIdleRace();
+          if (currentMode === "wheel") drawWheel(0);
+          if (currentMode === "survival") resetSurvivalArena();
+        }
+
+        // Đồng bộ Live Event (Kết quả quay mới nhất từ người khác trong phòng)
+        if (data.live_event && data.live_event.id && data.live_event.id !== lastLiveEventId) {
+          lastLiveEventId = data.live_event.id;
+          if (data.live_event.actor !== session.username) {
+            showToast(`🔴 LIVE: ${data.live_event.text}`, "live");
+          }
+        }
+
+        // Đồng bộ Chat & History
+        if (Array.isArray(data.chat_messages)) {
+          state.chat_messages = data.chat_messages;
+          renderChatFeed();
+        }
+        if (Array.isArray(data.history)) {
+          state.history = data.history;
+          renderHistoryList();
+        }
+
+        // Kiểm tra cảnh cáo cá nhân
         const warn = data.user.pending_warning;
         if (warn && warn.id && warn.id !== currentWarnId) {
           currentWarnId = warn.id;
@@ -1902,6 +2317,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           sfxWarningAlarm();
         }
 
+        session.muted = !!data.user.muted;
         const changed =
           session.role !== data.user.role ||
           JSON.stringify(session.allowed_features) !== JSON.stringify(data.user.allowed_features);
@@ -1914,6 +2330,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             openMode("hub");
           }
         }
+
         if (data.users) {
           state.users = data.users;
           state.banned_ips = data.banned_ips || {};
@@ -1924,17 +2341,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
     } catch (e) {}
   }
 
-  // --- ADMIN CENTER FUNCTIONS ---
+  // --- ADMIN CENTER & ACTIONS ---
   function renderAdminCenter() {
     const tbody = document.getElementById("admin-users-tbody");
     if (!tbody) return;
     document.getElementById("toggle-guest-join").checked = !!state.settings.allow_guest_join;
+    document.getElementById("toggle-chat-enabled").checked = !!state.settings.chat_enabled;
     document.getElementById("toggle-lockdown").checked = !!state.settings.room_lockdown;
     document.getElementById("toggle-auto-ban-strike").checked = !!state.settings.auto_ban_on_3_strikes;
 
+    const searchKw = (document.getElementById("admin-user-search")?.value || "").toLowerCase().trim();
+    const filterVal = document.getElementById("admin-user-filter")?.value || "all";
     const now = Date.now() / 1000;
-    tbody.innerHTML = Object.values(state.users).map(u => {
-      const isOnline = (now - (u.last_seen || 0)) < 10 && u.status === "active";
+
+    const filteredUsers = Object.values(state.users).filter(u => {
+      const isOnline = (now - (u.last_seen || 0)) < 12 && u.status === "active";
+      if (searchKw && !u.username.toLowerCase().includes(searchKw) && !(u.ip || "").includes(searchKw)) return false;
+      if (filterVal === "online" && !isOnline) return false;
+      if (filterVal === "banned" && u.status === "active") return false;
+      if (filterVal === "warned" && (u.strikes || 0) <= 0) return false;
+      return true;
+    });
+
+    tbody.innerHTML = filteredUsers.map(u => {
+      const isOnline = (now - (u.last_seen || 0)) < 12 && u.status === "active";
       let statusHtml = "";
       if (u.status === "banned_perm") {
         statusHtml = `<span class="status-dot dot-banned"></span><b style="color:#f87171;">Cấm vĩnh viễn</b>`;
@@ -1948,19 +2378,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       const isOwner = u.role === "owner";
+      const canManageTarget = session.role === "owner" || (session.role === "admin" && !isOwner && u.role !== "admin");
       const featCount = (u.allowed_features || []).length;
       const safeUser = esc(u.username);
 
       return `
         <tr>
           <td>
-            <div style="font-weight:800;">${safeUser} ${u.has_pin ? '🔐' : ''}</div>
+            <div style="font-weight:800;">${safeUser} ${u.has_pin ? '🔐' : ''} ${u.muted ? '🔇' : ''}</div>
             <div style="font-size:0.72rem; color:var(--text-muted);">${esc(u.device)} • IP: ${esc(u.ip)}</div>
           </td>
           <td>
-            ${isOwner ? '<span class="role-badge role-owner">OWNER</span>' : `
+            ${isOwner || !canManageTarget ? `<span class="role-badge role-${esc(u.role)}">${esc(u.role)}</span>` : `
               <select onchange="adminAction('${safeUser}', 'set_role', {role: this.value})" style="padding:4px 8px; font-size:0.78rem;">
-                <option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>
+                ${session.role === 'owner' ? `<option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>` : ''}
                 <option value="member" ${u.role==='member'?'selected':''}>Member</option>
                 <option value="viewer" ${u.role==='viewer'?'selected':''}>Viewer</option>
               </select>
@@ -1970,28 +2401,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div>${statusHtml}</div>
             <div style="margin-top:4px;">
               <span class="strike-pill">⚠️ Gậy: ${u.strikes || 0}/3</span>
-              ${u.strikes > 0 ? `<button class="btn-xs" style="padding:1px 6px; font-size:0.68rem;" onclick="adminAction('${safeUser}', 'reset_strikes', {})">Xoá gậy</button>` : ''}
+              ${u.strikes > 0 && canManageTarget ? `<button class="btn-xs" style="padding:1px 6px; font-size:0.68rem;" onclick="adminAction('${safeUser}', 'reset_strikes', {})">Xoá gậy</button>` : ''}
             </div>
           </td>
           <td>
-            ${isOwner ? 'Toàn quyền (10/10)' : `
-              <button class="btn-xs" onclick="openPermModal('${safeUser}')">🛠️ Giới hạn (${featCount}/10)</button>
+            ${isOwner || u.role === 'admin' ? 'Toàn quyền (11/11)' : `
+              <button class="btn-xs" onclick="openPermModal('${safeUser}')">🛠️ Giới hạn (${featCount}/11)</button>
             `}
           </td>
           <td>
-            ${isOwner ? `
-              <button class="btn-xs" onclick="adminChangePin('${safeUser}')">🔑 Đổi PIN Owner</button>
-            ` : `
+            ${isOwner ? (session.role === 'owner' ? `<button class="btn-xs" onclick="openChangePinModal('${safeUser}')">🔑 Đổi PIN Owner</button>` : '<span style="color:var(--text-muted); font-size:0.76rem;">Chủ phòng tối cao</span>') : (!canManageTarget ? '<span style="color:var(--text-muted); font-size:0.76rem;">Đồng cấp Admin</span>' : `
               <div class="admin-actions-row">
-                <button class="btn-xs warn" onclick="adminWarnUser('${safeUser}')">⚠️ Cảnh cáo</button>
-                <button class="btn-xs warn" onclick="adminKickUser('${safeUser}')">🥾 Kick</button>
+                <button class="btn-xs warn" onclick="openWarnModal('${safeUser}')">⚠️ Cảnh cáo</button>
+                <button class="btn-xs ${u.muted ? 'unban' : 'warn'}" onclick="adminAction('${safeUser}', 'toggle_mute', {})">${u.muted ? '🔊 Mở chat' : '🔇 Cấm chat'}</button>
+                <button class="btn-xs warn" onclick="openKickModal('${safeUser}')">🥾 Kick</button>
                 <button class="btn-xs warn" onclick="openTempBanModal('${safeUser}')">⏳ Cấm thời hạn</button>
-                <button class="btn-xs ban" onclick="adminPermBanUser('${safeUser}', '${esc(u.ip)}')">🚫 Cấm vĩnh viễn</button>
-                <button class="btn-xs" onclick="adminChangePin('${safeUser}')">🔑 Đổi PIN</button>
+                <button class="btn-xs ban" onclick="openPermBanModal('${safeUser}', '${esc(u.ip)}')">🚫 Cấm vĩnh viễn</button>
+                <button class="btn-xs" onclick="openChangePinModal('${safeUser}')">🔑 PIN</button>
                 ${u.status !== 'active' ? `<button class="btn-xs unban" onclick="adminAction('${safeUser}', 'unban', {})">🔓 Mở khoá</button>` : ''}
                 <button class="btn-xs" onclick="adminAction('${safeUser}', 'delete', {})">🗑️</button>
               </div>
-            `}
+            `)}
           </td>
         </tr>
       `;
@@ -2031,9 +2461,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     state.banned_ips = data.banned_ips || {};
     state.audit_logs = data.audit_logs || [];
     state.settings = data.settings || state.settings;
+    if (Array.isArray(data.chat_messages)) {
+      state.chat_messages = data.chat_messages;
+      renderChatFeed();
+    }
     applyRoomStateBanners();
     renderAdminCenter();
-    showToast("Đã cập nhật lệnh quản trị!", "success");
+    showToast("Đã thực thi lệnh quản trị!", "success");
   }
 
   function adminAddUser() {
@@ -2046,71 +2480,120 @@ HTML_PAGE = r"""<!DOCTYPE html>
     document.getElementById("new-u-pin").value = "";
   }
 
-  function adminWarnUser(u) {
-    const reason = prompt(`Nhập nội dung CẢNH CÁO gửi trực tiếp lên màn hình của "${u}":`, "Vui lòng tuân thủ quy định phòng chơi!");
-    if (!reason) return;
-    adminAction(u, "warn_user", { reason, add_strike: true });
+  function openWarnModal(u) {
+    openUnifiedModal({
+      type: "warn_user",
+      target: u,
+      title: `⚠️ Gửi Cảnh Cáo Tới: ${u}`,
+      subtitle: "Thông báo kèm âm thanh cảnh báo sẽ bật ngay lập tức trên màn hình người này (+1 gậy).",
+      inputLabel: "Nội dung cảnh cáo",
+      defaultValue: "Vui lòng tuân thủ quy định phòng chơi!",
+      chips: ["Không spam nút quay!", "Giữ lịch sự khi chat!", "Cảnh báo lần cuối!"],
+      submitText: "⚠️ Gửi Cảnh Cáo",
+      btnColor: "orange"
+    });
   }
 
-  function adminKickUser(u) {
-    const reason = prompt(`Nhập lý do mời "${u}" ra khỏi phòng:`, "Quản trị viên mời bạn ra khỏi phòng.");
-    if (reason === null) return;
-    adminAction(u, "kick", { reason });
+  function openKickModal(u) {
+    openUnifiedModal({
+      type: "kick",
+      target: u,
+      title: `🥾 Mời Ra Khỏi Phòng: ${u}`,
+      subtitle: "Ngắt kết nối ngay lập tức (người này có thể đăng nhập lại sau).",
+      inputLabel: "Lý do mời ra khỏi phòng",
+      defaultValue: "Quản trị viên mời bạn ra khỏi phòng.",
+      chips: ["AFK quá lâu", "Gây rối trật tự", "Dọn phòng"],
+      submitText: "🥾 Xác Nhận Kick",
+      btnColor: "orange"
+    });
   }
 
-  // --- MODAL CẤM CÓ THỜI HẠN (PHÚT / GIỜ / NGÀY / NĂM) ---
-  function openTempBanModal(username) {
-    tempBanTargetUser = username;
-    document.getElementById("tb-target-user").textContent = username;
-    document.getElementById("tb-duration").value = "15";
-    document.getElementById("tb-unit").value = "minutes";
-    document.getElementById("tb-reason").value = "";
-    document.getElementById("temp-ban-modal").classList.add("open");
+  function openTempBanModal(u) {
+    openUnifiedModal({
+      type: "ban_temp",
+      target: u,
+      title: `⏳ Cấm Có Thời Hạn: ${u}`,
+      subtitle: "Chọn thời lượng và đơn vị thời gian (Phút / Giờ / Ngày / Năm):",
+      showDuration: true,
+      inputLabel: "Lý do tạm khoá",
+      placeholder: "VD: Spam liên tục...",
+      chips: ["Spam nút quay", "Ngôn từ không phù hợp", "Phá danh sách chung"],
+      submitText: "⏳ Xác Nhận Cấm",
+      btnColor: "orange"
+    });
   }
 
-  function closeTempBanModal() {
-    document.getElementById("temp-ban-modal").classList.remove("open");
+  function openPermBanModal(u, ip) {
+    const validIp = ip && ip !== "-" && ip !== "127.0.0.1";
+    openUnifiedModal({
+      type: "ban_perm",
+      target: u,
+      ip,
+      title: `🚫 Cấm Vĩnh Viễn: ${u}`,
+      subtitle: "Khoá vĩnh viễn tài khoản này khỏi hệ thống.",
+      inputLabel: "Lý do cấm vĩnh viễn",
+      defaultValue: "Vi phạm nghiêm trọng quy định phòng.",
+      showCheckbox: validIp,
+      checkboxLabel: `Chặn vĩnh viễn luôn địa chỉ IP (${ip})`,
+      submitText: "🚫 Cấm Vĩnh Viễn",
+      btnColor: "red"
+    });
   }
 
-  function setTempBanQuick(val, unit) {
-    document.getElementById("tb-duration").value = String(val);
-    document.getElementById("tb-unit").value = unit;
+  function openChangePinModal(u) {
+    openUnifiedModal({
+      type: "change_pin",
+      target: u,
+      title: `🔑 Đặt / Đổi Mã PIN: ${u}`,
+      subtitle: "Nhập mã PIN mới (để trống nếu muốn xoá mật khẩu tài khoản này).",
+      inputLabel: "Mã PIN mới",
+      placeholder: "Nhập mã PIN...",
+      submitText: "💾 Lưu Mã PIN"
+    });
   }
 
-  function submitTempBan() {
-    const duration = parseFloat(document.getElementById("tb-duration").value);
-    const unit = document.getElementById("tb-unit").value;
-    const reason = document.getElementById("tb-reason").value.trim();
-    if (isNaN(duration) || duration <= 0) {
-      return showToast("Số lượng thời gian cấm phải lớn hơn 0!", "error");
-    }
-    adminAction(tempBanTargetUser, "ban_temp", { duration, unit, reason });
-    closeTempBanModal();
+  function openSelfChangePin() {
+    if (!session.username) return;
+    openUnifiedModal({
+      type: "self_change_pin",
+      target: session.username,
+      title: `🔑 Đổi Mã PIN Cá Nhân (${session.username})`,
+      subtitle: "Cài mã PIN để bảo vệ tên của bạn không bị người khác mạo danh.",
+      inputLabel: "Mã PIN cá nhân mới",
+      placeholder: "Nhập mã PIN mới...",
+      submitText: "💾 Cập Nhật PIN"
+    });
   }
 
-  function adminPermBanUser(u, ip) {
-    const reason = prompt(`Xác nhận CẤM VĨNH VIỄN "${u}". Nhập lý do cấm:`, "Vi phạm nghiêm trọng — Cấm vĩnh viễn.");
-    if (reason === null) return;
-    const banIpToo = ip && ip !== "-" && ip !== "127.0.0.1" ? confirm(`Bạn có muốn chặn luôn địa chỉ IP (${ip}) của người này không?`) : false;
-    adminAction(u, "ban_perm", { reason, ban_ip: banIpToo });
+  function openBanIpModal() {
+    openUnifiedModal({
+      type: "ban_ip_manual",
+      title: "🌐 Chặn Địa Chỉ IP Thủ Công",
+      subtitle: "Mọi thiết bị dùng địa chỉ IP này sẽ bị từ chối truy cập.",
+      inputLabel: "Địa chỉ IP (IPv4 / IPv6)",
+      placeholder: "VD: 192.168.1.55",
+      submitText: "🚫 Chặn IP Ngay",
+      btnColor: "red"
+    });
   }
 
-  function adminBanIpPrompt() {
-    const ip = prompt("Nhập địa chỉ IP muốn chặn vĩnh viễn:");
-    if (!ip) return;
-    const reason = prompt("Nhập lý do chặn IP:", "Chặn IP bởi Quản trị viên.");
-    adminAction("", "ban_ip_manual", { ip: ip.trim(), reason: reason || "" });
-  }
-
-  function adminChangePin(u) {
-    const newPin = prompt(`Nhập mã PIN mới cho tài khoản "${u}" (Để trống nếu muốn xoá PIN):`);
-    if (newPin === null) return;
-    adminAction(u, "change_pin", { new_pin: newPin.trim() });
+  function openSavePresetModal() {
+    if (!hasPermission("edit_roster")) return showToast("🔒 Bạn không có quyền lưu mẫu mới!", "error");
+    openUnifiedModal({
+      type: "save_preset",
+      title: "💾 Lưu Bộ Danh Sách Mẫu Mới",
+      subtitle: "Lưu danh sách hiện tại vào thư viện mẫu để dùng lại nhanh lần sau.",
+      inputLabel: "Tên bộ danh sách",
+      placeholder: "VD: Danh sách nhóm 1...",
+      submitText: "💾 Lưu Mẫu",
+      btnColor: "green"
+    });
   }
 
   function updateRoomSettings() {
     adminAction("", "update_settings", {
       allow_guest_join: document.getElementById("toggle-guest-join").checked,
+      chat_enabled: document.getElementById("toggle-chat-enabled").checked,
       room_lockdown: document.getElementById("toggle-lockdown").checked,
       auto_ban_on_3_strikes: document.getElementById("toggle-auto-ban-strike").checked
     });
@@ -2153,6 +2636,80 @@ HTML_PAGE = r"""<!DOCTYPE html>
     closePermModal();
   }
 
+  // --- BACKUP EXPORT / IMPORT ---
+  async function exportBackupData() {
+    const res = await fetch("/api/admin/export", { headers: authHeaders() });
+    if (!res.ok) return showToast("Không thể xuất sao lưu!", "error");
+    const data = await res.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `omnirandom_backup_${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("Đã tải xuống file sao lưu JSON!", "success");
+  }
+
+  async function submitImportBackup() {
+    const raw = document.getElementById("import-json-text").value.trim();
+    if (!raw) return showToast("Vui lòng dán nội dung JSON sao lưu!", "warning");
+    try {
+      const parsed = JSON.parse(raw);
+      const res = await fetch("/api/admin/import", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ backup: parsed })
+      });
+      const d = await res.json();
+      if (!res.ok) return showToast(d.error || "Dữ liệu không hợp lệ", "error");
+      document.getElementById("import-modal").classList.remove("open");
+      showToast("Đã khôi phục toàn bộ dữ liệu thành công!", "success");
+      await fetchInitialState();
+      renderAdminCenter();
+    } catch (e) {
+      showToast("Chuỗi JSON bị lỗi cú pháp!", "error");
+    }
+  }
+
+  // --- LIVE CHAT & REACTIONS ---
+  function renderChatFeed() {
+    const feed = document.getElementById("chat-feed");
+    if (!feed) return;
+    const msgs = state.chat_messages || [];
+    feed.innerHTML = msgs.length ? msgs.map(m => `
+      <div class="chat-msg">
+        <span class="sender ${esc(m.role)}">${esc(m.user)}:</span>
+        <span>${esc(m.text)}</span>
+        <span style="float:right; font-size:0.68rem; color:var(--text-muted);">${esc(m.time)}</span>
+      </div>
+    `).join("") : '<div style="color:var(--text-muted); font-size:0.8rem;">Chưa có tin nhắn nào...</div>';
+  }
+
+  function sendChatInput() {
+    const inp = document.getElementById("chat-input");
+    const txt = inp.value.trim();
+    if (!txt) return;
+    inp.value = "";
+    sendChatOrReact(txt);
+  }
+
+  async function sendChatOrReact(text) {
+    if (session.muted && session.role !== "owner" && session.role !== "admin") {
+      return showToast("🔇 Bạn đã bị Quản trị viên cấm chat!", "error");
+    }
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ text })
+    });
+    const d = await res.json();
+    if (!res.ok) return showToast(d.error || "Không thể gửi tin nhắn", "error");
+    state.chat_messages = d.chat_messages || [];
+    renderChatFeed();
+    sfxTone(720, 0.03, "sine", 0.04);
+  }
+
   // --- INITIALIZATION & ROSTER ---
   async function fetchInitialState() {
     const res = await fetch("/api/state", { headers: authHeaders() });
@@ -2161,12 +2718,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     updateRosterCounters();
     renderPresetDropdown();
     renderHistoryList();
+    renderChatFeed();
     applyRoomStateBanners();
     if (state.mobile_url) {
       document.getElementById("mobileBtn").textContent = "📱 " + state.mobile_url.replace("http://", "");
     }
     drawIdleRace();
     drawWheel(0);
+    resetSurvivalArena();
     initCageBalls();
     drawBombCanvas(1, "BẤM CHÂM NGÒI ĐỂ BẮT ĐẦU", false);
   }
@@ -2184,13 +2743,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const lines = document.getElementById("roster-textarea").value.split("\n").map(s => s.trim()).filter(Boolean);
     state.active_list = lines;
     updateRosterCounters();
-    await fetch("/api/roster", {
+    const res = await fetch("/api/roster", {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ items: lines })
     });
+    const d = await res.json();
+    if (d.roster_version) state.roster_version = d.roster_version;
     if (currentMode === "race") drawIdleRace();
     if (currentMode === "wheel") drawWheel(0);
+    if (currentMode === "survival") resetSurvivalArena();
     if (currentMode === "cage") initCageBalls();
   }
 
@@ -2226,20 +2788,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     showToast(`Đã nạp mẫu "${key}"`, "success");
   }
 
-  async function saveAsNewPreset() {
-    if (!hasPermission("edit_roster")) return showToast("🔒 Bạn không có quyền lưu mẫu mới!", "error");
-    const name = prompt("Đặt tên cho bộ danh sách này:");
-    if (!name) return;
-    const res = await fetch("/api/presets", {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify({ name: name.trim(), items: state.active_list })
-    });
-    state = await res.json();
-    renderPresetDropdown();
-    showToast("Đã lưu bộ danh sách mẫu!", "success");
-  }
-
   function openMode(mode) {
     if (mode !== "hub" && mode !== "admin" && !hasPermission(mode)) {
       return showToast(`🔒 Chức năng "${FEATURE_LABELS[mode]}" đã bị Admin khoá với bạn!`, "error");
@@ -2248,17 +2796,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return showToast("🔒 Chỉ Quản trị viên mới có quyền truy cập!", "error");
     }
     currentMode = mode;
-    document.querySelectorAll(".view-pane").forEach(el => el.classList.remove("active"));
+    document.querySelectorAll(".view-pane").forEach(el => {
+      el.classList.remove("active");
+      el.classList.remove("projector-mode");
+    });
     document.querySelectorAll(".mode-tab").forEach(el => {
       el.classList.toggle("active", el.getAttribute("data-mode") === mode);
     });
     document.getElementById("view-" + mode).classList.add("active");
-    document.getElementById("main-wrap").classList.toggle("full-hub", mode === "hub" || mode === "admin");
-    document.getElementById("history-panel").style.display = (mode === "hub" || mode === "admin") ? "none" : "block";
+    document.getElementById("main-wrap").classList.toggle("full-admin", mode === "admin");
+    document.getElementById("side-column").style.display = mode === "admin" ? "none" : "flex";
 
     if (mode === "admin") renderAdminCenter();
     if (mode === "race") drawIdleRace();
     if (mode === "wheel") drawWheel(0);
+    if (mode === "survival") resetSurvivalArena();
     if (mode === "cage") initCageBalls();
     if (mode === "teams") generateVisualTeams();
   }
@@ -2279,13 +2831,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   function renderHistoryList() {
     const box = document.getElementById("history-list");
     if (!state.history || !state.history.length) {
-      box.innerHTML = '<div style="color:var(--text-muted); font-size:0.82rem;">Chưa có lịch sử.</div>';
+      box.innerHTML = '<div style="color:var(--text-muted); font-size:0.8rem;">Chưa có lịch sử.</div>';
       return;
     }
     box.innerHTML = state.history.map(h => `
       <div class="history-card">
         <div class="meta"><span>${esc(h.game)}</span><span>${esc(h.time)}</span></div>
-        <div style="font-size:0.75rem; color:var(--text-muted);">${esc(h.summary)}</div>
+        <div style="font-size:0.74rem; color:var(--text-muted);">${esc(h.summary)}</div>
         <div class="val">${h.results.map(esc).join(" • ")}</div>
       </div>
     `).join("");
@@ -2394,7 +2946,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       else {
         raceRunning = false;
         const sorted = [...racers].sort((a, b) => b.x - a.x);
-        document.getElementById("race-winner-text").textContent = "🏆 Hạng Nhất: " + sorted[0].name;
+        const top3 = sorted.slice(0, 3).map((r, i) => `${["🥇", "🥈", "🥉"][i]} ${r.name}`);
+        document.getElementById("race-winner-text").textContent = top3.join("   |   ");
         document.getElementById("race-winner-banner").style.display = "flex";
         sfxFanfare(); shootConfetti(); triggerScreenShake();
         logHistory("🦆 Đua Tốc Độ", `Đua ${racers.length} tay đua`, [sorted[0].name]);
@@ -2403,23 +2956,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     requestAnimationFrame(step);
   }
 
-  // --- GAME 2: WHEEL ---
+  // --- GAME 2: WHEEL (WITH WORKING AUTO-REMOVE WINNER) ---
   let wheelAngle = 0, wheelSpinning = false;
   function parseWheelSlices() {
     return state.active_list.map(line => {
       if (line.includes("|")) {
         const [n, w] = line.split("|");
         const weight = parseFloat(w);
-        return { name: n.trim(), weight: !isNaN(weight) && weight > 0 ? weight : 1 };
+        return { name: n.trim(), weight: !isNaN(weight) && weight > 0 ? weight : 1, raw: line };
       }
-      return { name: line.trim(), weight: 1 };
+      return { name: line.trim(), weight: 1, raw: line };
     }).filter(x => x.name);
   }
   function drawWheel(deflect = 0, ledPhase = 0) {
     const slices = parseWheelSlices(), canvas = document.getElementById("wheel-canvas");
-    if (!canvas || !slices.length) return;
+    if (!canvas) return;
     const ctx = canvas.getContext("2d"), cx = 260, cy = 260, r = 225;
     ctx.clearRect(0, 0, 520, 520);
+    if (!slices.length) return;
 
     ctx.beginPath(); ctx.arc(cx, cy, r + 14, 0, Math.PI * 2);
     ctx.fillStyle = "#1e293b"; ctx.fill();
@@ -2494,12 +3048,88 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById("wheel-winner-banner").style.display = "flex";
         sfxFanfare(); shootConfetti(); triggerScreenShake();
         logHistory("🎡 Vòng Quay", `Quay ${slices.length} ô`, [win.name]);
+
+        // Tự loại ô đã trúng nếu được bật
+        if (document.getElementById("wheel-auto-remove").checked && hasPermission("edit_roster")) {
+          const idxRaw = state.active_list.indexOf(win.raw);
+          if (idxRaw !== -1) {
+            state.active_list.splice(idxRaw, 1);
+            document.getElementById("roster-textarea").value = state.active_list.join("\n");
+            setTimeout(() => syncRosterFromTextarea(), 600);
+          }
+        }
       }
     }
     requestAnimationFrame(step);
   }
 
-  // --- GAME 3: CAGE ---
+  // --- GAME 3: SURVIVAL ELIMINATION (LAST MAN STANDING) ---
+  let survivalPool = []; // [{name, alive}]
+  let survivalBusy = false;
+
+  function resetSurvivalArena() {
+    survivalPool = getCleanRoster().map(name => ({ name, alive: true }));
+    document.getElementById("survival-banner").style.display = "none";
+    renderSurvivalGrid(-1);
+  }
+
+  function renderSurvivalGrid(highlightIdx) {
+    const grid = document.getElementById("survival-grid");
+    if (!grid) return;
+    const aliveCount = survivalPool.filter(x => x.alive).length;
+    document.getElementById("surv-alive-count").textContent = aliveCount;
+    grid.innerHTML = survivalPool.map((p, idx) => {
+      let cls = "survivor-chip";
+      if (!p.alive) cls += " eliminated";
+      else if (aliveCount === 1) cls += " champion";
+      else if (idx === highlightIdx) cls += " scanning";
+      const prefix = !p.alive ? "❌ " : (aliveCount === 1 ? "👑 " : "🛡️ ");
+      return `<div class="${cls}">${prefix}${esc(p.name)}</div>`;
+    }).join("");
+  }
+
+  function eliminateOneRound() {
+    if (!canTriggerSpin() || survivalBusy) return;
+    const aliveIndices = survivalPool.map((p, i) => p.alive ? i : -1).filter(i => i !== -1);
+    if (aliveIndices.length <= 1) {
+      return showToast("Đã tìm ra nhà vô địch! Bấm 'Hồi sinh tất cả' để chơi ván mới.", "info");
+    }
+    survivalBusy = true;
+    const victimIdx = aliveIndices[Math.floor(Math.random() * aliveIndices.length)];
+    let hops = 0;
+    const maxHops = 14 + Math.floor(Math.random() * 8);
+
+    const timer = setInterval(() => {
+      const randIdx = aliveIndices[hops % aliveIndices.length];
+      renderSurvivalGrid(randIdx);
+      sfxTone(460 + hops * 18, 0.04);
+      hops++;
+      if (hops >= maxHops) {
+        clearInterval(timer);
+        survivalPool[victimIdx].alive = false;
+        survivalBusy = false;
+        renderSurvivalGrid(-1);
+        triggerScreenShake();
+        sfxWarningAlarm();
+
+        const remaining = survivalPool.filter(x => x.alive);
+        const banner = document.getElementById("survival-banner");
+        const bText = document.getElementById("survival-banner-text");
+        banner.style.display = "flex";
+
+        if (remaining.length === 1) {
+          bText.textContent = `👑 NHÀ VÔ ĐỊCH SỐNG SÓT CUỐI CÙNG: ${remaining[0].name}!`;
+          sfxFanfare(); shootConfetti();
+          logHistory("🏆 Đấu Trường Sinh Tồn", "Vô địch cuối cùng", [remaining[0].name]);
+        } else {
+          bText.textContent = `💥 Đã loại: ${survivalPool[victimIdx].name} (Còn lại ${remaining.length} người)`;
+          logHistory("🏆 Sinh Tồn", `Loại 1 người (Còn ${remaining.length})`, [`Loại: ${survivalPool[victimIdx].name}`]);
+        }
+      }
+    }, 85);
+  }
+
+  // --- GAME 4: CAGE ---
   let cageBalls = [], drawnBalls = [], cageAnimId = null;
   function initCageBalls() {
     const src = document.getElementById("cage-source")?.value || "roster";
@@ -2549,7 +3179,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     logHistory("🔮 Lồng Cầu", "Bật bóng xổ số", [picked.label]);
   }
 
-  // --- GAME 4: SLOT ---
+  // --- GAME 5: SLOT ---
   function pullSlotMachine() {
     if (!canTriggerSpin()) return;
     const mode = document.getElementById("slot-mode").value;
@@ -2580,24 +3210,44 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   }
 
-  // --- GAME 5: HAT ---
+  // --- GAME 6: HAT WITH INTERACTIVE 3D FLIP CARDS ---
   function drawFromHat() {
     if (!canTriggerSpin()) return;
     const pool = getCleanRoster();
     if (!pool.length) return showToast("Danh sách trống!", "warning");
     const count = Math.min(pool.length, Math.max(1, parseInt(document.getElementById("hat-count").value, 10) || 1));
+    const faceDown = document.getElementById("hat-face-down").checked;
     const hat = document.getElementById("hat-emoji");
     hat.classList.add("shaking");
     setTimeout(() => {
       hat.classList.remove("shaking");
       const picked = [...pool].sort(() => Math.random() - 0.5).slice(0, count);
-      document.getElementById("hat-results").innerHTML = picked.map(x => `<div class="magic-ticket">✨ ${esc(x)}</div>`).join("");
-      sfxFanfare(); shootConfetti();
+      document.getElementById("hat-results").innerHTML = picked.map((x, idx) => {
+        if (faceDown) {
+          return `<div class="magic-ticket unrevealed" data-val="${esc(x)}" onclick="revealSingleHatCard(this)">❓ Lá Thăm #${idx + 1} (Bấm lật)</div>`;
+        }
+        return `<div class="magic-ticket">✨ ${esc(x)}</div>`;
+      }).join("");
+      sfxFanfare();
+      if (!faceDown) shootConfetti();
       logHistory("🎩 Mũ Ma Thuật", `Rút ${count} phiếu`, picked);
     }, 550);
   }
 
-  // --- GAME 6: BOMB ---
+  function revealSingleHatCard(el) {
+    if (!el.classList.contains("unrevealed")) return;
+    const val = el.getAttribute("data-val");
+    el.classList.remove("unrevealed");
+    el.textContent = "✨ " + val;
+    sfxTone(780, 0.12, "sine", 0.12);
+    shootConfetti();
+  }
+
+  function revealAllHatCards() {
+    document.querySelectorAll("#hat-results .magic-ticket.unrevealed").forEach(el => revealSingleHatCard(el));
+  }
+
+  // --- GAME 7: BOMB ---
   let bombTimerId = null;
   function drawBombCanvas(ratio, label, exploded) {
     const canvas = document.getElementById("bomb-canvas");
@@ -2644,7 +3294,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     bombTimerId = requestAnimationFrame(tick);
   }
 
-  // --- GAME 7: TABLETOP ---
+  // --- GAME 8: TABLETOP ---
   const DICE_FACES = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
   function rollTabletop() {
     if (!canTriggerSpin()) return;
@@ -2671,7 +3321,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     sfxFanfare();
   }
 
-  // --- GAME 8: TEAMS ---
+  // --- GAME 9: TEAMS ---
   function generateVisualTeams() {
     if (!canTriggerSpin()) return;
     const members = [...getCleanRoster()].sort(() => Math.random() - 0.5);
@@ -2690,7 +3340,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     `).join("");
   }
 
-  // --- GAME 9: UTILITY ---
+  // --- GAME 10: UTILITY ---
   function updateUtilFields() {
     const t = document.getElementById("util-type").value;
     document.getElementById("util-num-inputs").style.display = t === "numbers" ? "inline-flex" : "none";
@@ -2718,6 +3368,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     state.history = data.history;
     renderHistoryList();
   }
+
+  window.addEventListener("keydown", e => {
+    if (e.key === "Escape") {
+      document.querySelectorAll(".projector-mode").forEach(el => el.classList.remove("projector-mode"));
+      closeUnifiedModal();
+      closePermModal();
+    }
+  });
 
   window.addEventListener("DOMContentLoaded", () => {
     fetchInitialState();
@@ -2756,9 +3414,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _authenticate(self, data):
-        from urllib.parse import unquote
-
-        uname = unquote(self.headers.get("X-Username", "")).strip()
+        uname = urllib.parse.unquote(self.headers.get("X-Username", "")).strip()
         token = self.headers.get("X-Token", "").strip()
         if not uname or not token:
             return None
@@ -2767,8 +3423,15 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
             return None
         return user
 
+    def _check_rate_limit(self, key, max_calls=20, window=10):
+        now = time.time()
+        calls = [t for t in ACTION_RATE.get(key, []) if now - t < window]
+        calls.append(now)
+        ACTION_RATE[key] = calls
+        return len(calls) <= max_calls
+
     def do_GET(self):
-        parsed = urlparse(self.path)
+        parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/state":
             with DATA_LOCK:
                 data = DataManager._unlocked_load()
@@ -2776,9 +3439,12 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     k: DataManager.sanitize_user_public(v) for k, v in data["users"].items()
                 }
                 resp = {
+                    "roster_version": data.get("roster_version", 1),
                     "presets": data["presets"],
                     "active_list": data["active_list"],
                     "history": data["history"],
+                    "chat_messages": data["chat_messages"],
+                    "live_event": data["live_event"],
                     "audit_logs": data["audit_logs"],
                     "users": safe_users,
                     "banned_ips": data["banned_ips"],
@@ -2786,6 +3452,15 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     "mobile_url": f"http://{get_lan_ip()}:{PORT}",
                 }
             self._send_json(resp)
+        elif parsed.path == "/api/admin/export":
+            with DATA_LOCK:
+                data = DataManager._unlocked_load()
+                actor = self._authenticate(data)
+                if not actor or actor.get("role") not in ("owner", "admin"):
+                    return self._send_json({"error": "Không có quyền xuất dữ liệu!"}, 403)
+                DataManager.add_audit(data, actor["username"], "Xuất bản sao lưu JSON toàn hệ thống")
+                DataManager._unlocked_save(data, sync_cloud=False)
+                return self._send_json(data)
         else:
             raw = HTML_PAGE.encode("utf-8")
             self.send_response(200)
@@ -2796,6 +3471,8 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
+        if length > 2_000_000:
+            return self._send_json({"error": "Dữ liệu gửi lên vượt quá giới hạn cho phép."}, 413)
         body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
         try:
             payload = json.loads(body)
@@ -2817,6 +3494,9 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
 
             if self.path == "/api/auth/login":
                 now = time.time()
+                # Dọn dẹp bộ nhớ FAILED_LOGINS định kỳ
+                if len(FAILED_LOGINS) > 500:
+                    FAILED_LOGINS.clear()
                 attempts = [t for t in FAILED_LOGINS.get(client_ip, []) if now - t < 60]
                 FAILED_LOGINS[client_ip] = attempts
                 if len(attempts) >= 5:
@@ -2845,6 +3525,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         "has_pin": bool(pin),
                         "role": "member",
                         "status": "active",
+                        "muted": False,
                         "ban_until": 0,
                         "ban_reason": "",
                         "strikes": 0,
@@ -2879,7 +3560,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         DataManager.add_audit(
                             data, "Bảo mật", f"Sai PIN vào tài khoản '{username}' từ IP {client_ip}", "warn"
                         )
-                        DataManager._unlocked_save(data)
+                        DataManager._unlocked_save(data, sync_cloud=False)
                         return self._send_json({"error": "Sai mã PIN / Mật khẩu tài khoản!"}, 401)
 
                     if user.get("status") == "kicked":
@@ -2898,9 +3579,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                 )
 
             elif self.path == "/api/heartbeat":
-                from urllib.parse import unquote
-
-                uname = unquote(self.headers.get("X-Username", "")).strip()
+                uname = urllib.parse.unquote(self.headers.get("X-Username", "")).strip()
                 token = self.headers.get("X-Token", "").strip()
                 user = data["users"].get(uname)
                 if not user:
@@ -2935,7 +3614,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                 user["last_seen"] = now
                 user["ip"] = client_ip
                 user["device"] = parse_device_label(ua)
-                DataManager._unlocked_save(data)
+                DataManager._unlocked_save(data, sync_cloud=False)
 
                 online_count = sum(
                     1
@@ -2947,6 +3626,11 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     "user": DataManager.sanitize_user_public(user),
                     "online_count": max(1, online_count),
                     "settings": data["settings"],
+                    "roster_version": data.get("roster_version", 1),
+                    "active_list": data["active_list"],
+                    "live_event": data["live_event"],
+                    "chat_messages": data["chat_messages"],
+                    "history": data["history"][:25],
                 }
                 if user.get("role") in ("owner", "admin"):
                     resp["users"] = {
@@ -2965,6 +3649,50 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                 DataManager._unlocked_save(data)
                 return self._send_json({"ok": True})
 
+            elif self.path == "/api/auth/change_my_pin":
+                new_p = str(payload.get("new_pin", "")).strip()[:32]
+                h, s = hash_pin(new_p)
+                actor["pin_hash"] = h
+                actor["pin_salt"] = s
+                actor["has_pin"] = bool(new_p)
+                DataManager.add_audit(data, actor["username"], "Tự cập nhật mã PIN bảo vệ cá nhân")
+                DataManager._unlocked_save(data)
+                return self._send_json({"ok": True})
+
+            elif self.path == "/api/chat":
+                if not data["settings"].get("chat_enabled", True) and actor.get("role") not in ("owner", "admin"):
+                    return self._send_json({"error": "Quản trị viên đang tạm tắt kênh chat phòng!"}, 403)
+                if actor.get("muted") and actor.get("role") not in ("owner", "admin"):
+                    return self._send_json({"error": "Bạn đang bị cấm chat!"}, 403)
+                if not self._check_rate_limit(f"chat:{actor['username']}", max_calls=8, window=10):
+                    return self._send_json({"error": "Bạn gửi tin nhắn quá nhanh, vui lòng chậm lại!"}, 429)
+
+                txt = str(payload.get("text", "")).strip()[:180]
+                if txt:
+                    data["chat_messages"].append(
+                        {
+                            "id": str(uuid.uuid4())[:8],
+                            "time": datetime.datetime.now().strftime("%H:%M"),
+                            "user": actor["username"],
+                            "role": actor["role"],
+                            "text": txt,
+                        }
+                    )
+                    data["chat_messages"] = data["chat_messages"][-50:]
+                    DataManager._unlocked_save(data, sync_cloud=False)
+                return self._send_json({"chat_messages": data["chat_messages"]})
+
+            elif self.path == "/api/admin/import":
+                if actor.get("role") not in ("owner", "admin"):
+                    return self._send_json({"error": "Không có quyền khôi phục dữ liệu!"}, 403)
+                backup = payload.get("backup")
+                if not isinstance(backup, dict):
+                    return self._send_json({"error": "Định dạng JSON sao lưu không hợp lệ."}, 400)
+                restored = DataManager._normalize_data(backup)
+                DataManager.add_audit(restored, actor["username"], "Khôi phục dữ liệu từ bản sao lưu JSON", "warn")
+                DataManager._unlocked_save(restored)
+                return self._send_json({"ok": True})
+
             elif self.path == "/api/admin/action":
                 if actor.get("role") not in ("owner", "admin"):
                     return self._send_json({"error": "Không có quyền Quản trị viên!"}, 403)
@@ -2974,11 +3702,35 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
 
                 if action == "update_settings":
                     data["settings"]["allow_guest_join"] = bool(payload.get("allow_guest_join", True))
+                    data["settings"]["chat_enabled"] = bool(payload.get("chat_enabled", True))
                     data["settings"]["room_lockdown"] = bool(payload.get("room_lockdown", False))
                     data["settings"]["auto_ban_on_3_strikes"] = bool(
                         payload.get("auto_ban_on_3_strikes", True)
                     )
                     DataManager.add_audit(data, actor["username"], "Cập nhật cài đặt bảo mật phòng")
+
+                elif action == "clear_chat":
+                    data["chat_messages"] = []
+                    DataManager.add_audit(data, actor["username"], "Xoá toàn bộ tin nhắn phòng")
+
+                elif action == "kick_all_guests":
+                    kicked_cnt = 0
+                    for u in data["users"].values():
+                        if u.get("role") in ("member", "viewer") and u.get("status") == "active":
+                            u["status"] = "kicked"
+                            u["ban_reason"] = "Quản trị viên đã dọn phòng."
+                            u["session_token"] = str(uuid.uuid4())
+                            kicked_cnt += 1
+                    DataManager.add_audit(data, actor["username"], f"Kick hàng loạt {kicked_cnt} thành viên", "warn")
+
+                elif action == "unban_all":
+                    for u in data["users"].values():
+                        if u.get("status") != "active":
+                            u["status"] = "active"
+                            u["ban_until"] = 0
+                            u["ban_reason"] = ""
+                    data["banned_ips"] = {}
+                    DataManager.add_audit(data, actor["username"], "Ân xá & mở khoá toàn bộ tài khoản/IP")
 
                 elif action == "set_broadcast":
                     if payload.get("active"):
@@ -3009,14 +3761,18 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                 elif action == "create_user":
                     if not target_name:
                         return self._send_json({"error": "Thiếu tên user"}, 400)
+                    role_req = payload.get("role", "member")
+                    if role_req == "admin" and actor.get("role") != "owner":
+                        role_req = "member"
                     p_hash, p_salt = hash_pin(payload.get("pin", "").strip())
                     data["users"][target_name] = {
                         "username": target_name,
                         "pin_hash": p_hash,
                         "pin_salt": p_salt,
                         "has_pin": bool(p_hash),
-                        "role": payload.get("role", "member"),
+                        "role": role_req,
                         "status": "active",
+                        "muted": False,
                         "ban_until": 0,
                         "ban_reason": "",
                         "strikes": 0,
@@ -3027,7 +3783,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         "ip": "-",
                         "device": "Chưa đăng nhập",
                     }
-                    DataManager.add_audit(data, actor["username"], f"Tạo tài khoản '{target_name}'")
+                    DataManager.add_audit(data, actor["username"], f"Tạo tài khoản '{target_name}' ({role_req})")
 
                 else:
                     target = data["users"].get(target_name)
@@ -3037,14 +3793,25 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         return self._send_json({"error": "Không thể kỷ luật tài khoản Owner gốc!"}, 403)
                     if target.get("role") == "owner" and actor.get("role") != "owner":
                         return self._send_json({"error": "Chỉ Owner mới được đổi PIN của chính mình!"}, 403)
+                    if target.get("role") == "admin" and actor.get("role") != "owner":
+                        return self._send_json({"error": "Chỉ Owner mới có quyền quản lý Admin đồng cấp!"}, 403)
 
                     if action == "set_role":
                         new_role = payload.get("role", "member")
+                        if new_role == "admin" and actor.get("role") != "owner":
+                            return self._send_json({"error": "Chỉ Owner mới được phong quyền Admin!"}, 403)
                         if new_role in ("admin", "member", "viewer"):
                             target["role"] = new_role
                             DataManager.add_audit(
                                 data, actor["username"], f"Đổi quyền '{target_name}' thành {new_role}"
                             )
+                    elif action == "toggle_mute":
+                        target["muted"] = not bool(target.get("muted", False))
+                        DataManager.add_audit(
+                            data,
+                            actor["username"],
+                            f"{'Cấm chat' if target['muted'] else 'Mở chat'} đối với '{target_name}'",
+                        )
                     elif action == "set_permissions":
                         target["allowed_features"] = payload.get("allowed_features", list(ALL_FEATURES))
                         DataManager.add_audit(
@@ -3144,6 +3911,7 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                         "users": safe_users,
                         "banned_ips": data["banned_ips"],
                         "audit_logs": data["audit_logs"],
+                        "chat_messages": data["chat_messages"],
                         "settings": data["settings"],
                     }
                 )
@@ -3160,8 +3928,9 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                 ):
                     return self._send_json({"error": "Không có quyền sửa danh sách"}, 403)
                 data["active_list"] = [str(x)[:120] for x in payload.get("items", [])]
+                data["roster_version"] = int(data.get("roster_version", 1)) + 1
                 DataManager._unlocked_save(data)
-                return self._send_json({"ok": True})
+                return self._send_json({"ok": True, "roster_version": data["roster_version"]})
 
             elif self.path == "/api/presets":
                 if actor.get("role") not in ("owner", "admin") and "edit_roster" not in actor.get(
@@ -3174,9 +3943,11 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
                     DataManager._unlocked_save(data)
                 return self._send_json(
                     {
+                        "roster_version": data.get("roster_version", 1),
                         "presets": data["presets"],
                         "active_list": data["active_list"],
                         "history": data["history"],
+                        "chat_messages": data["chat_messages"],
                         "settings": data["settings"],
                     }
                 )
@@ -3184,17 +3955,24 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/api/log":
                 if actor.get("role") == "viewer":
                     return self._send_json({"error": "Viewer không được ghi lịch sử"}, 403)
+                game_title = str(payload.get("game", "Random"))[:40]
+                results_list = [str(x)[:120] for x in payload.get("results", [])]
                 data["history"].insert(
                     0,
                     {
                         "id": str(uuid.uuid4())[:8],
                         "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                        "game": f"{payload.get('game', 'Random')} ({actor['username']})",
+                        "game": f"{game_title} ({actor['username']})",
                         "summary": str(payload.get("summary", ""))[:120],
-                        "results": [str(x)[:120] for x in payload.get("results", [])],
+                        "results": results_list,
                     },
                 )
                 data["history"] = data["history"][:60]
+                data["live_event"] = {
+                    "id": str(uuid.uuid4())[:8],
+                    "actor": actor["username"],
+                    "text": f"{actor['username']} vừa chơi {game_title} → {', '.join(results_list[:3])}",
+                }
                 DataManager._unlocked_save(data)
                 return self._send_json({"history": data["history"]})
 
@@ -3238,7 +4016,7 @@ if __name__ == "__main__":
     mobile_url = f"http://{lan_ip}:{PORT}"
 
     print("=" * 68)
-    print("🛡️ OMNIRANDOM ARCADE v5.1 (SECURITY, WARNINGS & FX EDITION) READY!")
+    print("🚀 OMNIRANDOM ARCADE v6.0 (ULTIMATE LIVE & SECURITY EDITION) READY!")
     print("=" * 68)
     print(f"💻 Local URL : {local_url}")
     print(f"📱 Mobile IP : {mobile_url}")
@@ -3252,4 +4030,4 @@ if __name__ == "__main__":
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nĐã đóng OmniRandom Arcade v5.1.")
+            print("\nĐã đóng OmniRandom Arcade v6.0.")
